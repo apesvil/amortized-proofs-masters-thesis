@@ -4,6 +4,7 @@ use ark_ff::{One, PrimeField, UniformRand};
 use ark_std::rand::RngCore;
 
 /// Structured reference string: SRS = { [τⁱg]_{i=0..d} in G1, h and τh in G2 }.
+#[derive(Clone)]
 pub struct Srs {
     pub(crate) powers_g1: Vec<G1Affine>, // [g, τg, τ²g, ..., τᵈg]
     pub(crate) g2: G2Affine,             // h

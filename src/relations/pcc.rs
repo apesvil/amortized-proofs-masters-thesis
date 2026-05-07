@@ -16,6 +16,7 @@ pub struct PccParams {
     pub srs: Srs,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct PccStatement {
     /// `c_i = pc.commit(ck, p_i(X), d_i)` for each i.
     pub commitments: Vec<Comm>,
@@ -32,12 +33,12 @@ pub struct PccWitness {
 
 /// A constraint `Q ∈ F[X, Y_1, ..., Y_n]` as a sum of monomials
 /// `coeff · X^{x_deg} · ∏_{(i, e) ∈ y_terms} Y_i^e`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Constraint {
     pub monomials: Vec<Monomial>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Monomial {
     pub coeff: Fr,
     pub x_deg: usize,

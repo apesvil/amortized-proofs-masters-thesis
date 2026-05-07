@@ -21,6 +21,7 @@ pub struct MParams {
     pub n: usize,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct MStatement {
     pub c_n_u: Comm,
     pub c_t_u: Comm,
