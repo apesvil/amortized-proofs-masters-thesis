@@ -105,6 +105,71 @@ impl Relation for MRelation {
     }
 }
 
+/// Build a leaf-form `R_M` instance for the bivariate evaluation
+/// `P(α, β) = y`, where `P` is the bivariate polynomial encoded by
+/// `params.matrix` (per the leaf construction in `delegation.tex`).
+///
+/// Polynomials follow the paper's leaf shape:
+/// ```text
+///   N_u(X) = (X^n − 1)·α − (α^n − 1)·X       T_u(X) = X − α
+///   N_v(X) = (X^n − 1)·β − (β^n − 1)·X       T_v(X) = X − β
+/// ```
+/// with `u = λ(α)`, `v = λ(β)`, `y = uᵀ M v`. The returned
+/// `(s, w)` satisfies `MRelation::is_satisfied(params, &s, &w)`.
+pub fn leaf_instance(params: &MParams, alpha: Fr, beta: Fr) -> (MStatement, MWitness) {
+    let dom = Radix2EvaluationDomain::<Fr>::new(params.n)
+        .expect("n must be a power of two");
+    let alpha_n_minus_1 = dom.evaluate_vanishing_polynomial(alpha);
+    let beta_n_minus_1 = dom.evaluate_vanishing_polynomial(beta);
+
+    let n_u = SparsePolynomial::from_coefficients_vec(vec![
+        (0, -alpha),
+        (1, -alpha_n_minus_1),
+        (params.n, alpha),
+    ]);
+    let t_u = SparsePolynomial::from_coefficients_vec(vec![
+        (0, -alpha),
+        (1, Fr::from(1u64)),
+    ]);
+    let n_v = SparsePolynomial::from_coefficients_vec(vec![
+        (0, -beta),
+        (1, -beta_n_minus_1),
+        (params.n, beta),
+    ]);
+    let t_v = SparsePolynomial::from_coefficients_vec(vec![
+        (0, -beta),
+        (1, Fr::from(1u64)),
+    ]);
+
+    let u = dom.evaluate_all_lagrange_coefficients(alpha);
+    let v = dom.evaluate_all_lagrange_coefficients(beta);
+
+    let c_n_u = pc::commit(&params.srs, &Poly::Sparse(n_u.clone()));
+    let c_t_u = pc::commit(&params.srs, &Poly::Sparse(t_u.clone()));
+    let c_n_v = pc::commit(&params.srs, &Poly::Sparse(n_v.clone()));
+    let c_t_v = pc::commit(&params.srs, &Poly::Sparse(t_v.clone()));
+
+    let y: Fr = params
+        .matrix
+        .iter()
+        .map(|&(i, j, m_ij)| m_ij * u[i] * v[j])
+        .sum();
+
+    let stmt = MStatement {
+        c_n_u,
+        c_t_u,
+        c_n_v,
+        c_t_v,
+        d_n_u: params.n,
+        d_t_u: 1,
+        d_n_v: params.n,
+        d_t_v: 1,
+        value: y,
+    };
+    let wit = MWitness { n_u, t_u, u, n_v, t_v, v };
+    (stmt, wit)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -115,62 +180,17 @@ mod tests {
     use ark_ff::UniformRand;
     use ark_std::test_rng;
 
-    /// Build a leaf-form witness for given α, β and domain size n.
-    /// Polynomials follow the paper's formulas:
-    ///   N_u(X) = (X^n - 1)·α - (α^n - 1)·X        T_u(X) = X - α
-    ///   N_v(X) = (X^n - 1)·β - (β^n - 1)·X        T_v(X) = X - β
-    fn leaf_witness(alpha: Fr, beta: Fr, n: usize) -> MWitness {
-        let dom = Radix2EvaluationDomain::<Fr>::new(n).unwrap();
-        let alpha_n_minus_1 = dom.evaluate_vanishing_polynomial(alpha);
-        let beta_n_minus_1 = dom.evaluate_vanishing_polynomial(beta);
-
-        let n_u = SparsePolynomial::from_coefficients_vec(vec![
-            (0, -alpha),
-            (1, -alpha_n_minus_1),
-            (n, alpha),
-        ]);
-        let t_u = SparsePolynomial::from_coefficients_vec(vec![(0, -alpha), (1, Fr::from(1u64))]);
-        let n_v = SparsePolynomial::from_coefficients_vec(vec![
-            (0, -beta),
-            (1, -beta_n_minus_1),
-            (n, beta),
-        ]);
-        let t_v = SparsePolynomial::from_coefficients_vec(vec![(0, -beta), (1, Fr::from(1u64))]);
-
-        let u = dom.evaluate_all_lagrange_coefficients(alpha);
-        let v = dom.evaluate_all_lagrange_coefficients(beta);
-
-        MWitness { n_u, t_u, u, n_v, t_v, v }
-    }
-
-    /// Build the (params, statement, witness) tuple for an identity matrix M_n.
-    /// y is the inner product ⟨u, v⟩.
+    /// Build params (identity matrix `M_n`) plus a single leaf instance from
+    /// random `(α, β)`.
     fn leaf_identity(n: usize) -> (MParams, MStatement, MWitness) {
         let rng = &mut test_rng();
-        let alpha = Fr::rand(rng);
-        let beta = Fr::rand(rng);
-        let wit = leaf_witness(alpha, beta, n);
-
-        // M = I_n
         let matrix: Vec<(usize, usize, Fr)> =
             (0..n).map(|i| (i, i, Fr::from(1u64))).collect();
-        let y: Fr = wit.u.iter().zip(&wit.v).map(|(a, b)| *a * *b).sum();
-
-        // SRS large enough for degree-n N polynomials.
         let srs = pc::setup(n + 1, rng);
-
-        let stmt = MStatement {
-            c_n_u: pc::commit(&srs, &Poly::Sparse(wit.n_u.clone())),
-            c_t_u: pc::commit(&srs, &Poly::Sparse(wit.t_u.clone())),
-            c_n_v: pc::commit(&srs, &Poly::Sparse(wit.n_v.clone())),
-            c_t_v: pc::commit(&srs, &Poly::Sparse(wit.t_v.clone())),
-            d_n_u: n,
-            d_t_u: 1,
-            d_n_v: n,
-            d_t_v: 1,
-            value: y,
-        };
         let params = MParams { srs, matrix, n };
+        let alpha = Fr::rand(rng);
+        let beta = Fr::rand(rng);
+        let (stmt, wit) = leaf_instance(&params, alpha, beta);
         (params, stmt, wit)
     }
 
@@ -208,5 +228,31 @@ mod tests {
         // n_u has degree 4; claiming d_n_u = 3 must fail the degree check.
         s.d_n_u = 3;
         assert!(!MRelation::is_satisfied(&p, &s, &w));
+    }
+
+    /// Build K = 4 leaves from random `(α_i, β_i)` pairs (sharing one params)
+    /// and check each one satisfies `R_M`. This is the multi-verifier setup
+    /// the protocol consumes.
+    #[test]
+    fn k_leaves_all_satisfy() {
+        let rng = &mut test_rng();
+        let n = 4;
+        let k = 4;
+        let matrix: Vec<(usize, usize, Fr)> =
+            (0..n).map(|i| (i, i, Fr::from(1u64))).collect();
+        let srs = pc::setup(n + 1, rng);
+        let params = MParams { srs, matrix, n };
+
+        let points: Vec<(Fr, Fr)> =
+            (0..k).map(|_| (Fr::rand(rng), Fr::rand(rng))).collect();
+        let leaves: Vec<(MStatement, MWitness)> = points
+            .iter()
+            .map(|&(a, b)| leaf_instance(&params, a, b))
+            .collect();
+
+        assert_eq!(leaves.len(), k);
+        for (s, w) in &leaves {
+            assert!(MRelation::is_satisfied(&params, s, w));
+        }
     }
 }

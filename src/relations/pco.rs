@@ -29,6 +29,7 @@ pub struct PcoStatement {
     pub value: Fr,
 }
 
+#[derive(Clone)]
 pub struct PcoWitness {
     pub polynomial: SparsePolynomial<Fr>,
 }

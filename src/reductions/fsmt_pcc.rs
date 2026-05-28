@@ -1,33 +1,34 @@
 use ark_bls12_381::Fr;
 use ark_ff::Zero;
-use ark_poly::Polynomial;
+use ark_poly::{univariate::SparsePolynomial, Polynomial};
 
 use crate::merkle::{verify_membership_from_hash, MembershipProof, MerkleTree};
+use crate::pc::Comm;
 use crate::relations::pcc::{PccParams, PccStatement, PccWitness};
+use crate::relations::pcc_d::PccDStatement;
 use crate::relations::pco::{PcoStatement, PcoWitness};
 use crate::transcript::Blake3Transcript;
 
-use super::rok_pcc::{absorb_pcc_statement, evaluate_constraint, pow_fr};
+use super::rok_dt::{RokDt, RokDtProof};
+use super::rok_pcc::{absorb_pcc_d_statement, evaluate_constraint};
 
-/// `FsMt(RokPcc, κ)` — the Merkle-tree / Fiat-Shamir transform applied to
-/// the `R_PCC → R_PCO^n` reduction.
+/// `FsMt(Π_DT ∘ Π_PC, κ)` — the Merkle-tree / Fiat-Shamir transform applied
+/// to the composed `R_PCC → R_PCC-D → R_PCO` chain.
 ///
-/// The verifier's first message in the inner protocol — the evaluation
-/// point `x` — is derived from the Merkle root of the `K = 2^κ` leaf
-/// statements. Because every leaf binds to the same root, **all `K` leaves
-/// share the same `x`**. The downstream PCO statements (one per polynomial
-/// per leaf, so `K · n` total) all evaluate at this shared point and can be
-/// batched in a single `RokPco` step.
-///
-/// Per-leaf transcript discipline: the verifier of leaf `b` must arrive at
-/// `verify` with the same transcript state the prover had at the start of
-/// `reduce_amortized`.
+/// Per-leaf input is an `R_PCC` instance; per-leaf output is a single
+/// `R_PCO` instance at a *shared* evaluation point `x` (derived from the
+/// Merkle root over the K per-leaf `R_PCC-D` statements). All `K · 1 = K`
+/// outputs share `x` and feed directly into `PcoFold`.
 pub struct FsMtPcc;
 
-/// Per-leaf proof: the prover's evaluations `y_i = p_i(x)`, the Merkle
-/// membership proof for the leaf, and the tree root (so the verifier can
-/// independently verify membership without reconstructing the tree).
+/// Per-leaf proof:
+/// - `shifted_commitments`: the `Π_DT` prover message (n commitments).
+/// - `values`: the `Π_PC` prover message (2n evaluations at x).
+/// - `membership`: Merkle membership of this leaf's PCC-D statement.
+/// - `root`: the Merkle root (so the verifier can independently verify
+///   membership without reconstructing the tree).
 pub struct FsMtPccProof {
+    pub shifted_commitments: Vec<Comm>,
     pub values: Vec<Fr>,
     pub membership: MembershipProof,
     pub root: [u8; 32],
@@ -40,82 +41,104 @@ impl FsMtPcc {
         stmts: &[PccStatement],
         wits: &[PccWitness],
         transcript: &mut Blake3Transcript,
-    ) -> Vec<(FsMtPccProof, Vec<PcoStatement>, Vec<PcoWitness>)> {
-        assert_eq!(stmts.len(), wits.len(), "stmts and wits must agree in length");
+    ) -> Vec<(FsMtPccProof, PcoStatement, PcoWitness)> {
+        assert_eq!(stmts.len(), wits.len());
         let k = stmts.len();
         assert!(
             k.is_power_of_two() && k >= 2,
             "K must be a power of two ≥ 2"
         );
 
-        // 1. Hash each statement, binding to the current transcript state.
-        let leaf_hashes: Vec<[u8; 32]> = stmts
+        // 1. Per leaf, run Π_DT in a leaf-tagged fork (the fork's final
+        //    state is discarded — Π_DT contributes only its deterministic
+        //    output, not any FS state).
+        let mut dt_proofs: Vec<RokDtProof> = Vec::with_capacity(k);
+        let mut d_stmts: Vec<PccDStatement> = Vec::with_capacity(k);
+        // PccDWitness owns polynomials — we move into a Vec.
+        let mut d_wits: Vec<crate::relations::pcc_d::PccDWitness> = Vec::with_capacity(k);
+
+        for (i, (s, w)) in stmts.iter().zip(wits).enumerate() {
+            let mut t_dt = transcript.fork(b"fsmt_pcc::dt");
+            t_dt.absorb_usize(b"leaf_idx", i);
+            let (dt_proof, d_stmt, d_wit) = RokDt::reduce(params, s, w, &mut t_dt);
+            dt_proofs.push(dt_proof);
+            d_stmts.push(d_stmt);
+            d_wits.push(d_wit);
+        }
+
+        // 2. Hash each PCC-D statement, build the Merkle tree, absorb the root.
+        let leaf_hashes: Vec<[u8; 32]> = d_stmts
             .iter()
             .enumerate()
-            .map(|(i, s)| hash_leaf(transcript, i, s))
+            .map(|(i, d)| hash_leaf(transcript, i, d))
             .collect();
-
-        // 2. Build tree, absorb root, derive shared x.
         let tree = MerkleTree::from_leaf_hashes(&leaf_hashes);
         let root = tree.root();
         transcript.absorb_bytes(b"fsmt_pcc::root", &root);
+
+        // 3. Squeeze the shared evaluation point.
         let x: Fr = transcript.squeeze_field(b"fsmt_pcc::x");
 
-        // 3. Per-leaf outputs.
-        let big_d = params.srs.powers_g1.len();
+        // 4. Per-leaf Π_PC: evaluate at x, derive per-leaf r, compute RLC.
         (0..k)
             .map(|i| {
-                let stmt = &stmts[i];
-                let wit = &wits[i];
+                let d_stmt = &d_stmts[i];
+                let d_wit = &d_wits[i];
 
-                let values: Vec<Fr> =
-                    wit.polynomials.iter().map(|p| p.evaluate(&x)).collect();
-
-                let pco_stmts: Vec<PcoStatement> = stmt
-                    .commitments
-                    .iter()
-                    .zip(&stmt.degrees)
-                    .zip(&values)
-                    .map(|((c, &d_i), &y)| {
-                        let s = pow_fr(x, big_d - d_i);
-                        PcoStatement {
-                            commitment: *c * s,
-                            point: x,
-                            value: y * s,
-                        }
-                    })
-                    .collect();
-                let pco_wits: Vec<PcoWitness> = wit
+                let values: Vec<Fr> = d_wit
                     .polynomials
                     .iter()
-                    .zip(&stmt.degrees)
-                    .map(|(p, &d_i)| {
-                        let s = pow_fr(x, big_d - d_i);
-                        PcoWitness { polynomial: p * s }
-                    })
+                    .map(|p| p.evaluate(&x))
                     .collect();
 
+                let mut t_pc = transcript.fork(b"fsmt_pcc::pc");
+                t_pc.absorb_usize(b"leaf_idx", i);
+                for v in &values {
+                    t_pc.absorb(b"y", v);
+                }
+                let r: Fr = t_pc.squeeze_field(b"r");
+
+                let (combined_poly, combined_comm, combined_value) =
+                    rlc(&d_wit.polynomials, &d_stmt.commitments, &values, r);
+
+                let pco_stmt = PcoStatement {
+                    commitment: combined_comm,
+                    point: x,
+                    value: combined_value,
+                };
+                let pco_wit = PcoWitness { polynomial: combined_poly };
+
                 let proof = FsMtPccProof {
+                    shifted_commitments: dt_proofs[i].shifted_commitments.clone(),
                     values,
                     membership: tree.membership_proof(i),
                     root,
                 };
-                (proof, pco_stmts, pco_wits)
+                (proof, pco_stmt, pco_wit)
             })
             .collect()
     }
 
-    /// Per-leaf verifier. Returns `None` on either Merkle-membership failure
-    /// or constraint-check failure (`Q_j(x, values) ≠ 0`).
+    /// Per-leaf verifier. Returns `None` on Merkle-membership failure or on
+    /// the Schwartz–Zippel constraint check (`Q_j(x, values) ≠ 0`).
     pub fn verify(
         params: &PccParams,
         index: usize,
         stmt: &PccStatement,
         proof: &FsMtPccProof,
         transcript: &mut Blake3Transcript,
-    ) -> Option<Vec<PcoStatement>> {
-        // 1. Recompute leaf hash and check Merkle membership.
-        let leaf_hash = hash_leaf(transcript, index, stmt);
+    ) -> Option<PcoStatement> {
+        // 1. Reconstruct the leaf's PCC-D statement via Π_DT.verify
+        //    (using the same fork-and-tag the prover did).
+        let mut t_dt = transcript.fork(b"fsmt_pcc::dt");
+        t_dt.absorb_usize(b"leaf_idx", index);
+        let dt_proof = RokDtProof {
+            shifted_commitments: proof.shifted_commitments.clone(),
+        };
+        let d_stmt = RokDt::verify(params, stmt, &dt_proof, &mut t_dt);
+
+        // 2. Verify Merkle membership.
+        let leaf_hash = hash_leaf(transcript, index, &d_stmt);
         let kappa = proof.membership.sibling_hashes.len();
         if !verify_membership_from_hash(
             kappa,
@@ -127,44 +150,76 @@ impl FsMtPcc {
             return None;
         }
 
-        // 2. Absorb root, derive shared x (same as the prover).
+        // 3. Absorb root, derive shared x (same as the prover).
         transcript.absorb_bytes(b"fsmt_pcc::root", &proof.root);
         let x: Fr = transcript.squeeze_field(b"fsmt_pcc::x");
 
-        // 3. Schwartz–Zippel constraint check.
-        for q in &stmt.constraints {
+        // 4. Schwartz–Zippel constraint check.
+        for q in &d_stmt.constraints {
             if !evaluate_constraint(q, x, &proof.values).is_zero() {
                 return None;
             }
         }
 
-        // 4. Build shifted PCO statements.
-        let big_d = params.srs.powers_g1.len();
-        Some(
-            stmt.commitments
-                .iter()
-                .zip(&stmt.degrees)
-                .zip(&proof.values)
-                .map(|((c, &d_i), &y)| {
-                    let s = pow_fr(x, big_d - d_i);
-                    PcoStatement {
-                        commitment: *c * s,
-                        point: x,
-                        value: y * s,
-                    }
-                })
-                .collect(),
-        )
+        // 5. Derive per-leaf r.
+        let mut t_pc = transcript.fork(b"fsmt_pcc::pc");
+        t_pc.absorb_usize(b"leaf_idx", index);
+        for v in &proof.values {
+            t_pc.absorb(b"y", v);
+        }
+        let r: Fr = t_pc.squeeze_field(b"r");
+
+        // 6. RLC on commitments and values.
+        let mut r_pow = Fr::from(1u64);
+        let mut combined_comm = Comm::zero();
+        let mut combined_value = Fr::from(0u64);
+        for (c, &y) in d_stmt.commitments.iter().zip(&proof.values) {
+            combined_comm += *c * r_pow;
+            combined_value += y * r_pow;
+            r_pow *= r;
+        }
+
+        Some(PcoStatement {
+            commitment: combined_comm,
+            point: x,
+            value: combined_value,
+        })
     }
 }
 
-fn hash_leaf(parent: &Blake3Transcript, index: usize, s: &PccStatement) -> [u8; 32] {
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn hash_leaf(parent: &Blake3Transcript, index: usize, d_stmt: &PccDStatement) -> [u8; 32] {
     let mut t = parent.fork(b"fsmt_pcc::leaf");
     t.absorb_usize(b"index", index);
-    absorb_pcc_statement(&mut t, s);
+    absorb_pcc_d_statement(&mut t, d_stmt);
     let mut out = [0u8; 32];
     t.squeeze_bytes(b"hash", &mut out);
     out
+}
+
+/// Random linear combination of polynomials, commitments, and values with
+/// bases `r^k`.
+fn rlc(
+    polys: &[SparsePolynomial<Fr>],
+    comms: &[Comm],
+    values: &[Fr],
+    r: Fr,
+) -> (SparsePolynomial<Fr>, Comm, Fr) {
+    let mut r_pow = Fr::from(1u64);
+    let mut combined_poly = SparsePolynomial::<Fr>::zero();
+    let mut combined_comm = Comm::zero();
+    let mut combined_value = Fr::from(0u64);
+    for ((p, c), &y) in polys.iter().zip(comms).zip(values) {
+        let scaled_poly = p * r_pow;
+        combined_poly = &combined_poly + &scaled_poly;
+        combined_comm += *c * r_pow;
+        combined_value += y * r_pow;
+        r_pow *= r;
+    }
+    (combined_poly, combined_comm, combined_value)
 }
 
 // ---------------------------------------------------------------------------
@@ -178,7 +233,6 @@ mod tests {
     use crate::pc::{self, Poly, Srs};
     use crate::relations::pcc::{Constraint, Monomial};
     use crate::relations::pco::{PcoParams, PcoRelation};
-    use crate::reductions::rok_pco::RokPco;
     use ark_poly::univariate::SparsePolynomial;
     use ark_std::test_rng;
 
@@ -191,19 +245,11 @@ mod tests {
         let c1 = pc::commit(srs, &Poly::Sparse(p1.clone()));
         let stmt = PccStatement {
             commitments: vec![c0, c1],
-            degrees: vec![1, 1], // strict: deg < 1 → constants
+            degrees: vec![1, 1], // paper-strict: deg < 1 ⇒ constants
             constraints: vec![Constraint {
                 monomials: vec![
-                    Monomial {
-                        coeff: Fr::from(1u64),
-                        x_deg: 0,
-                        y_terms: vec![(0, 1)],
-                    },
-                    Monomial {
-                        coeff: -Fr::from(1u64),
-                        x_deg: 0,
-                        y_terms: vec![(1, 1)],
-                    },
+                    Monomial { coeff:  Fr::from(1u64), x_deg: 0, y_terms: vec![(0, 1)] },
+                    Monomial { coeff: -Fr::from(1u64), x_deg: 0, y_terms: vec![(1, 1)] },
                 ],
             }],
         };
@@ -233,46 +279,39 @@ mod tests {
         let outputs = FsMtPcc::reduce_amortized(&params, &stmts, &wits, &mut t);
 
         let pco_params = PcoParams { srs: params.srs.clone() };
-        for (_, pco_stmts, pco_wits) in &outputs {
-            for (s, w) in pco_stmts.iter().zip(pco_wits) {
-                assert!(PcoRelation::is_satisfied(&pco_params, s, w));
-            }
+        for (_, pco_stmt, pco_wit) in &outputs {
+            assert!(PcoRelation::is_satisfied(&pco_params, pco_stmt, pco_wit));
         }
     }
 
-    /// Every PCO statement across every leaf shares the same evaluation point.
-    /// This is the amortization invariant.
+    /// Every output's `point` equals the shared `x` (amortization invariant).
     #[test]
     fn all_leaves_share_x() {
         let (params, stmts, wits) = k_leaves(4);
         let mut t = Blake3Transcript::new(b"test");
         let outputs = FsMtPcc::reduce_amortized(&params, &stmts, &wits, &mut t);
-        let x = outputs[0].1[0].point;
-        for (_, pco_stmts, _) in &outputs {
-            for s in pco_stmts {
-                assert_eq!(s.point, x);
-            }
+        let x = outputs[0].1.point;
+        for (_, pco_stmt, _) in &outputs {
+            assert_eq!(pco_stmt.point, x);
         }
     }
 
-    /// Per-leaf verify must reconstruct the same `Vec<PcoStatement>` the
-    /// prover produced for that leaf.
+    /// Per-leaf verify reconstructs the prover's PCO statement.
     #[test]
     fn prover_verifier_agree() {
         let (params, stmts, wits) = k_leaves(4);
         let mut t_p = Blake3Transcript::new(b"test");
         let outputs = FsMtPcc::reduce_amortized(&params, &stmts, &wits, &mut t_p);
 
-        for (i, (proof, prover_stmts, _)) in outputs.iter().enumerate() {
+        for (i, (proof, prover_stmt, _)) in outputs.iter().enumerate() {
             let mut t_v = Blake3Transcript::new(b"test");
-            let verifier_stmts = FsMtPcc::verify(&params, i, &stmts[i], proof, &mut t_v)
+            let verifier_stmt = FsMtPcc::verify(&params, i, &stmts[i], proof, &mut t_v)
                 .expect("honest verify must succeed");
-            assert_eq!(*prover_stmts, verifier_stmts);
+            assert_eq!(*prover_stmt, verifier_stmt);
         }
     }
 
-    /// Verifying leaf 0 against the proof for leaf 1 must fail (Merkle path
-    /// hashes will not chain to the same root).
+    /// Wrong leaf index → membership fails.
     #[test]
     fn wrong_leaf_index_rejected() {
         let (params, stmts, wits) = k_leaves(4);
@@ -281,11 +320,10 @@ mod tests {
 
         let proof_for_1 = &outputs[1].0;
         let mut t_v = Blake3Transcript::new(b"test");
-        // Try to verify stmts[0] using the proof intended for index 1.
         assert!(FsMtPcc::verify(&params, 0, &stmts[0], proof_for_1, &mut t_v).is_none());
     }
 
-    /// Tampering with the proof's claimed root must fail Merkle membership.
+    /// Tampered root fails Merkle membership.
     #[test]
     fn tampered_root_rejected() {
         let (params, stmts, wits) = k_leaves(4);
@@ -294,13 +332,10 @@ mod tests {
         outputs[0].0.root[0] ^= 0xFF;
 
         let mut t_v = Blake3Transcript::new(b"test");
-        assert!(
-            FsMtPcc::verify(&params, 0, &stmts[0], &outputs[0].0, &mut t_v).is_none()
-        );
+        assert!(FsMtPcc::verify(&params, 0, &stmts[0], &outputs[0].0, &mut t_v).is_none());
     }
 
-    /// Tampering a `y` value flips the constraint check (with overwhelming
-    /// probability) so verify returns `None`.
+    /// Tampered y values fail the constraint check.
     #[test]
     fn tampered_y_rejected() {
         let (params, stmts, wits) = k_leaves(4);
@@ -309,36 +344,26 @@ mod tests {
         outputs[0].0.values[0] += Fr::from(1u64);
 
         let mut t_v = Blake3Transcript::new(b"test");
-        assert!(
-            FsMtPcc::verify(&params, 0, &stmts[0], &outputs[0].0, &mut t_v).is_none()
-        );
+        assert!(FsMtPcc::verify(&params, 0, &stmts[0], &outputs[0].0, &mut t_v).is_none());
     }
 
-    /// The K · n PCO outputs across all leaves share the same evaluation
-    /// point and can be batched into a single PCO instance via `RokPco`.
-    /// This is the end-to-end amortization payoff.
+    /// The K per-leaf PCO outputs all share `x` and can be folded across
+    /// leaves via `PcoFold` (we'll verify this once PcoFold lands; here we
+    /// just check they're suitable input — same point, well-formed).
     #[test]
-    fn outputs_batchable_by_rok_pco() {
+    fn outputs_ready_for_pco_fold() {
         let (params, stmts, wits) = k_leaves(4);
         let mut t = Blake3Transcript::new(b"test");
         let outputs = FsMtPcc::reduce_amortized(&params, &stmts, &wits, &mut t);
 
-        let mut all_stmts = Vec::new();
-        let mut all_wits = Vec::new();
-        for (_, ss, ws) in outputs {
-            all_stmts.extend(ss);
-            all_wits.extend(ws);
+        let x = outputs[0].1.point;
+        for (_, s, _) in &outputs {
+            assert_eq!(s.point, x);
         }
 
-        let mut t_pco = Blake3Transcript::new(b"test_pco");
-        let (batched_stmt, batched_wit) =
-            RokPco::reduce(&all_stmts, &all_wits, &mut t_pco);
-
         let pco_params = PcoParams { srs: params.srs.clone() };
-        assert!(PcoRelation::is_satisfied(
-            &pco_params,
-            &batched_stmt,
-            &batched_wit
-        ));
+        for (_, s, w) in &outputs {
+            assert!(PcoRelation::is_satisfied(&pco_params, s, w));
+        }
     }
 }

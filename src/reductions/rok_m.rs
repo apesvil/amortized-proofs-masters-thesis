@@ -334,81 +334,25 @@ fn build_constraints(gamma: Fr) -> Vec<Constraint> {
 mod tests {
     use super::*;
     use crate::core::Relation;
-    use crate::relations::m::MRelation;
+    use crate::relations::m::{leaf_instance, MRelation};
     use crate::relations::pcc::{PccParams, PccRelation};
     use ark_ff::UniformRand;
-    use ark_poly::{
-        univariate::SparsePolynomial, EvaluationDomain, Radix2EvaluationDomain,
-    };
+    use ark_poly::univariate::SparsePolynomial;
     use ark_std::test_rng;
-
-    fn leaf_witness(alpha: Fr, beta: Fr, n: usize) -> MWitness {
-        let dom = Radix2EvaluationDomain::<Fr>::new(n).unwrap();
-        let alpha_n_minus_1 = dom.evaluate_vanishing_polynomial(alpha);
-        let beta_n_minus_1 = dom.evaluate_vanishing_polynomial(beta);
-
-        let n_u = SparsePolynomial::from_coefficients_vec(vec![
-            (0, -alpha),
-            (1, -alpha_n_minus_1),
-            (n, alpha),
-        ]);
-        let t_u = SparsePolynomial::from_coefficients_vec(vec![
-            (0, -alpha),
-            (1, Fr::from(1u64)),
-        ]);
-        let n_v = SparsePolynomial::from_coefficients_vec(vec![
-            (0, -beta),
-            (1, -beta_n_minus_1),
-            (n, beta),
-        ]);
-        let t_v = SparsePolynomial::from_coefficients_vec(vec![
-            (0, -beta),
-            (1, Fr::from(1u64)),
-        ]);
-
-        let u = dom.evaluate_all_lagrange_coefficients(alpha);
-        let v = dom.evaluate_all_lagrange_coefficients(beta);
-
-        MWitness { n_u, t_u, u, n_v, t_v, v }
-    }
 
     /// Build params + two leaf statements/witnesses for the identity matrix M_n.
     /// The SRS is sized for the *folded* polynomials (deg n+1, the largest
     /// produced by the reduction), which also covers the leaves (deg n).
     fn two_identity_leaves(n: usize) -> (MParams, (MStatement, MWitness), (MStatement, MWitness)) {
         let rng = &mut test_rng();
-        let alpha0 = Fr::rand(rng);
-        let beta0 = Fr::rand(rng);
-        let alpha1 = Fr::rand(rng);
-        let beta1 = Fr::rand(rng);
-        let w0 = leaf_witness(alpha0, beta0, n);
-        let w1 = leaf_witness(alpha1, beta1, n);
-
         let matrix: Vec<(usize, usize, Fr)> =
             (0..n).map(|i| (i, i, Fr::from(1u64))).collect();
-        let y0: Fr = w0.u.iter().zip(&w0.v).map(|(a, b)| *a * *b).sum();
-        let y1: Fr = w1.u.iter().zip(&w1.v).map(|(a, b)| *a * *b).sum();
-
         // After folding, N_u* has degree n+1 (each N has degree n, each T has degree 1).
         let srs = pc::setup(n + 1, rng);
-
-        let s0 = MStatement {
-            c_n_u: pc::commit(&srs, &Poly::Sparse(w0.n_u.clone())),
-            c_t_u: pc::commit(&srs, &Poly::Sparse(w0.t_u.clone())),
-            c_n_v: pc::commit(&srs, &Poly::Sparse(w0.n_v.clone())),
-            c_t_v: pc::commit(&srs, &Poly::Sparse(w0.t_v.clone())),
-            d_n_u: n, d_t_u: 1, d_n_v: n, d_t_v: 1,
-            value: y0,
-        };
-        let s1 = MStatement {
-            c_n_u: pc::commit(&srs, &Poly::Sparse(w1.n_u.clone())),
-            c_t_u: pc::commit(&srs, &Poly::Sparse(w1.t_u.clone())),
-            c_n_v: pc::commit(&srs, &Poly::Sparse(w1.n_v.clone())),
-            c_t_v: pc::commit(&srs, &Poly::Sparse(w1.t_v.clone())),
-            d_n_u: n, d_t_u: 1, d_n_v: n, d_t_v: 1,
-            value: y1,
-        };
         let params = MParams { srs, matrix, n };
+
+        let (s0, w0) = leaf_instance(&params, Fr::rand(rng), Fr::rand(rng));
+        let (s1, w1) = leaf_instance(&params, Fr::rand(rng), Fr::rand(rng));
         (params, (s0, w0), (s1, w1))
     }
 
