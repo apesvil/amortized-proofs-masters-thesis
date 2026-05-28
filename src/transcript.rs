@@ -3,9 +3,10 @@ use ark_serialize::CanonicalSerialize;
 
 /// A Fiat-Shamir transcript backed by Blake3.
 ///
-/// Single random oracle (no per-round `fork`); the paper's FS uses
-/// independent oracles `ρ_i` per round, but with negligible soundness loss
-/// for a single-protocol setting (see `docs/future_revisions.md`).
+/// Provides a `fork(domain)` operation that derives an *independent* child
+/// transcript — used by `merkle.rs` to bind leaf hashes to the protocol
+/// context, and by future composed protocols to give each sub-proof its own
+/// challenge stream (the paper's `ρ_i` oracles).
 #[derive(Clone)]
 pub struct Blake3Transcript {
     hasher: blake3::Hasher,
@@ -66,6 +67,25 @@ impl Blake3Transcript {
         self.squeeze(label, &mut buf);
         F::from_le_bytes_mod_order(&buf)
     }
+
+    /// Squeeze raw pseudorandom bytes (used e.g. for Merkle leaf hashes).
+    pub fn squeeze_bytes(&mut self, label: &'static [u8], out: &mut [u8]) {
+        self.squeeze(label, out);
+    }
+
+    /// Derive an independent child transcript whose challenges are
+    /// uncorrelated with the parent's. Models the paper's `ρ_i` (an
+    /// independent random oracle).
+    pub fn fork(&self, domain: &'static [u8]) -> Self {
+        let current = self.hasher.finalize();
+        let mut key_material = Vec::with_capacity(32 + domain.len());
+        key_material.extend_from_slice(current.as_bytes());
+        key_material.extend_from_slice(domain);
+        let derived = blake3::derive_key("ap-transcript fork v0", &key_material);
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&derived);
+        Self::from_key(&key)
+    }
 }
 
 #[cfg(test)]
@@ -101,5 +121,38 @@ mod tests {
         let f1: Fr = t1.squeeze_field(b"x");
         let f2: Fr = t2.squeeze_field(b"x");
         assert_eq!(f1, f2);
+    }
+
+    /// Two forks with different domains must yield uncorrelated challenges.
+    #[test]
+    fn fork_produces_independent_sequences() {
+        let t = Blake3Transcript::new(b"test");
+        let mut a = t.fork(b"oracle_a");
+        let mut b = t.fork(b"oracle_b");
+        let fa: Fr = a.squeeze_field(b"x");
+        let fb: Fr = b.squeeze_field(b"x");
+        assert_ne!(fa, fb);
+    }
+
+    /// Forking the same parent state with the same domain is deterministic.
+    #[test]
+    fn fork_deterministic() {
+        let t = Blake3Transcript::new(b"test");
+        let mut a1 = t.fork(b"oracle");
+        let mut a2 = t.fork(b"oracle");
+        let f1: Fr = a1.squeeze_field(b"x");
+        let f2: Fr = a2.squeeze_field(b"x");
+        assert_eq!(f1, f2);
+    }
+
+    /// Forking does not advance the parent transcript.
+    #[test]
+    fn fork_does_not_mutate_parent() {
+        let mut a = Blake3Transcript::new(b"test");
+        let mut b = Blake3Transcript::new(b"test");
+        let _ = a.fork(b"side");
+        let fa: Fr = a.squeeze_field(b"x");
+        let fb: Fr = b.squeeze_field(b"x");
+        assert_eq!(fa, fb);
     }
 }
