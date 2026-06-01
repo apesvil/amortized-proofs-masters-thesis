@@ -12,8 +12,8 @@ use crate::transcript::Blake3Transcript;
 use super::rok_dt::{RokDt, RokDtProof};
 use super::rok_pcc::{absorb_pcc_d_statement, evaluate_constraint};
 
-/// `FsMt(Π_DT ∘ Π_PC, κ)` — the Merkle-tree / Fiat-Shamir transform applied
-/// to the composed `R_PCC → R_PCC-D → R_PCO` chain.
+/// `FsMt(Π_PC ∘ Π_DT, κ)` — the Merkle-tree / Fiat-Shamir transform applied
+/// to the composed `R_PCC --Π_DT--> R_PCC-D --Π_PC--> R_PCO` chain.
 ///
 /// Per-leaf input is an `R_PCC` instance; per-leaf output is a single
 /// `R_PCO` instance at a *shared* evaluation point `x` (derived from the
