@@ -26,6 +26,7 @@ pub struct PccStatement {
     pub constraints: Vec<Constraint>,
 }
 
+#[derive(Clone)]
 pub struct PccWitness {
     /// `p_i(X)` — the polynomials behind the commitments.
     pub polynomials: Vec<SparsePolynomial<Fr>>,

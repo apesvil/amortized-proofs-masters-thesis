@@ -17,6 +17,7 @@ use crate::transcript::Blake3Transcript;
 pub struct RokM;
 
 /// What the prover sends to the verifier.
+#[derive(Clone)]
 pub struct RokMProof {
     /// `z = u_0ᵀ M v_1 + u_1ᵀ M v_0` — the cross-term used in the new value.
     pub z: Fr,
