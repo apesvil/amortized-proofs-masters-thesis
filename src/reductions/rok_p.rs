@@ -5,6 +5,7 @@ use ark_poly::{
 };
 
 use crate::pc::{self, Comm, Opening, Poly};
+use crate::reductions::poly_util::x_shift;
 use crate::relations::m::{MParams, MStatement, MWitness};
 use crate::relations::p::PStatement;
 use crate::relations::pco::{PcoStatement, PcoWitness};
@@ -365,12 +366,6 @@ fn sparse_to_dense_vec(p: &SparsePolynomial<Fr>, len: usize) -> Vec<Fr> {
         }
     }
     v
-}
-
-fn x_shift(p: &SparsePolynomial<Fr>, k: usize) -> SparsePolynomial<Fr> {
-    SparsePolynomial::from_coefficients_vec(
-        p.iter().map(|&(deg, c)| (deg + k, c)).collect(),
-    )
 }
 
 /// Decompose `g''(X) = y/n + X·q_0(X) + (X^n − 1)·q_1(X)`,

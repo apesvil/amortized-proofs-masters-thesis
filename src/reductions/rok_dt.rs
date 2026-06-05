@@ -2,6 +2,7 @@ use ark_bls12_381::Fr;
 use ark_poly::univariate::SparsePolynomial;
 
 use crate::pc::{self, Comm, Poly};
+use crate::reductions::poly_util::x_shift;
 use crate::relations::pcc::{Constraint, Monomial, PccParams, PccStatement, PccWitness};
 use crate::relations::pcc_d::{PccDStatement, PccDWitness};
 use crate::transcript::Blake3Transcript;
@@ -132,13 +133,6 @@ impl RokDt {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Multiply a sparse polynomial by `X^k` (i.e. shift every exponent by `k`).
-fn x_shift(p: &SparsePolynomial<Fr>, k: usize) -> SparsePolynomial<Fr> {
-    SparsePolynomial::from_coefficients_vec(
-        p.iter().map(|&(deg, c)| (deg + k, c)).collect(),
-    )
-}
 
 /// Build the constraint `X^k · Y_i − Y_j = 0`.
 fn shift_constraint(k: usize, i: usize, j: usize) -> Constraint {

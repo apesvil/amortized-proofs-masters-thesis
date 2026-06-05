@@ -1,6 +1,7 @@
 pub mod fsmt_pcc;
 pub mod m_fold;
 pub mod pco_fold;
+mod poly_util;
 pub mod rok_dt;
 pub mod rok_m;
 pub mod rok_p;
