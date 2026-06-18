@@ -6,40 +6,50 @@ use ark_poly::{
 
 use crate::pc::{self, Comm, Opening, Poly};
 use crate::reductions::poly_util::x_shift;
-use crate::relations::m::{MParams, MStatement, MWitness};
+use crate::relations::abc::{AbcParams, AbcStatement, AbcWitness};
 use crate::relations::p::PStatement;
 use crate::relations::pco::{PcoStatement, PcoWitness};
 use crate::transcript::Blake3Transcript;
 
-/// `Π_P : R_M → R_P × R_PCO` (page 27 of the updated paper).
+/// `Π_P : R_{A,B,C} → R_P × R_PCO` (page 27 of the updated paper,
+/// generalized to three matrices).
 ///
-/// Introduces `w = M·v` as an auxiliary witness and proves both halves
-/// (`w = M·v` and `y = uᵀ·w`) via a single batched univariate sumcheck
-/// over `H`. The output is one `R_P` instance `(α, β, μ = M(α, β))`
-/// — discharged by direct evaluation of the matrix-encoded polynomial —
-/// and one `R_PCO` instance carrying the batched KZG opening obligation
-/// at `β` for all 14 polynomials touched by the protocol.
+/// Introduces `w_X = X·v` for `X ∈ {A, B, C}` as auxiliary witnesses and
+/// proves all six halves (each `w_X = X·v` and each `y_X = uᵀ·w_X`) via a
+/// single η-weighted univariate sumcheck over `H`. The combined sumcheck
+/// value is `y_A + η·y_B + η²·y_C`; the verifier's reconstruction of
+/// `G(β)` only depends on the linear combination `μ_A + η·μ_B + η²·μ_C`,
+/// so the prover ships a single `y` field instead of three separate `μ`s.
 ///
-/// **Polynomial-identity assumption.** The reduction reads `u(β)` and
-/// `v(β)` from the rational pairs as `N(β)/(n·T(β))`. This is only
-/// equal to the interpolant evaluation if `N(X) = n·T(X)·u(X)` holds
-/// as a *polynomial* identity (not just at `h_i ∈ H`). R_M's own
+/// Output:
+/// - `PStatement(α, β, y, η)` where `y = μ_A + η·μ_B + η²·μ_C` and
+///   `η` is this reduction's first-round Fiat-Shamir challenge,
+/// - `PcoStatement` carrying the batched KZG opening obligation at `β`
+///   over all 18 polynomials (9 unshifted + 9 shifted).
+///
+/// **Polynomial-identity assumption.** The verifier reads `u(β)` and
+/// `v(β)` from the rational pairs as `N(β)/(n·T(β))`. This is only equal
+/// to the interpolant evaluation if `N(X) = n·T(X)·u(X)` holds as a
+/// *polynomial* identity (not just at `h_i ∈ H`). R_{A,B,C}'s own
 /// `is_satisfied` is per-vertex; the polynomial identity is established
-/// at leaves by `leaf_correctness_pcc` (the Q_u, Q_v constraints there
-/// imply it) and preserved by Π_M's product structure
-/// (`N_u^* = N_u^A·T_u^B + γ·N_u^B·T_u^A`, `T_u^* = T_u^A·T_u^B` keeps
-/// the identity exact). All those upstream R_PCC promises are
+/// at leaves by `leaf_correctness_pcc` and preserved by Π_{ABC}'s product
+/// structure (`N_u^* = N_u^A·T_u^B + γ·N_u^B·T_u^A`, `T_u^* = T_u^A·T_u^B`
+/// keeps the identity exact). All those upstream R_PCC promises are
 /// discharged by the downstream R_PCO chain, so this reduction is sound
-/// only as part of the full pipeline — do not call it standalone on a
-/// raw R_M instance.
+/// only as part of the full pipeline — do not call it standalone on a raw
+/// R_{A,B,C} instance.
 pub struct RokP;
 
 /// Prover's wire message.
 #[derive(Clone)]
 pub struct RokPProof {
     // Round 1.
-    pub c_w: Comm,
-    pub c_w_shift: Comm,
+    pub c_w_a: Comm,
+    pub c_w_b: Comm,
+    pub c_w_c: Comm,
+    pub c_w_a_shift: Comm,
+    pub c_w_b_shift: Comm,
+    pub c_w_c_shift: Comm,
     pub c_n_u_shift: Comm,
     pub c_t_u_shift: Comm,
     pub c_n_v_shift: Comm,
@@ -49,26 +59,28 @@ pub struct RokPProof {
     pub c_q1: Comm,
     pub c_q0_shift: Comm,
     pub c_q1_shift: Comm,
-    // Evaluations at β (unshifted only; shifted entries derived as `β^shift · ev`).
+    // Evaluations at β (unshifted only; shifted derived as `β^shift · ev`).
     pub ev_n_u: Fr,
     pub ev_t_u: Fr,
     pub ev_n_v: Fr,
     pub ev_t_v: Fr,
-    pub ev_w: Fr,
+    pub ev_w_a: Fr,
+    pub ev_w_b: Fr,
+    pub ev_w_c: Fr,
     pub ev_q0: Fr,
     pub ev_q1: Fr,
-    // Prover's claim for `M(α, β)`; becomes the R_P `y`.
-    pub mu: Fr,
-    // η'-batched KZG opening at β.
+    /// Combined claim `μ_A + η·μ_B + η²·μ_C`; becomes the R_P `y`.
+    pub y: Fr,
+    /// η'-batched KZG opening at β.
     pub batched_opening: Opening,
 }
 
 impl RokP {
     /// Prover side. Returns `(R_P, R_PCO, R_PCO witness, proof)`.
     pub fn reduce(
-        params: &MParams,
-        stmt: &MStatement,
-        wit: &MWitness,
+        params: &AbcParams,
+        stmt: &AbcStatement,
+        wit: &AbcWitness,
         transcript: &mut Blake3Transcript,
     ) -> (PStatement, PcoStatement, PcoWitness, RokPProof) {
         let srs = &params.srs;
@@ -78,40 +90,52 @@ impl RokP {
             .expect("n must be a power of two");
         let n_fr = Fr::from(n as u64);
 
-        absorb_m_statement(transcript, stmt);
+        absorb_abc_statement(transcript, stmt);
 
-        // --- Compute w = M·v as a vector, then its IFFT interpolant.
-        let w_vec = matvec(&params.matrix, &wit.v, n);
-        let w_poly = ifft_sparse(&dom, &w_vec);
+        // --- Compute w_X = X·v vectors, then IFFT interpolants.
+        let w_a_vec = matvec(&params.matrix_a, &wit.v, n);
+        let w_b_vec = matvec(&params.matrix_b, &wit.v, n);
+        let w_c_vec = matvec(&params.matrix_c, &wit.v, n);
+        let w_a_poly = ifft_sparse(&dom, &w_a_vec);
+        let w_b_poly = ifft_sparse(&dom, &w_b_vec);
+        let w_c_poly = ifft_sparse(&dom, &w_c_vec);
         let u_poly = ifft_sparse(&dom, &wit.u);
         let v_poly = ifft_sparse(&dom, &wit.v);
 
-        // Strict degree bounds (M's `d_*` are inclusive).
+        // Strict degree bounds.
         let strict_d_n_u = stmt.d_n_u + 1;
         let strict_d_t_u = stmt.d_t_u + 1;
         let strict_d_n_v = stmt.d_n_v + 1;
         let strict_d_t_v = stmt.d_t_v + 1;
-        // u, v, w live on H of size n, so deg < n, strict bound n.
         let strict_d_w = n;
-        // q_0, q_1 both have strict bound n-1 (the tightened bound).
         let strict_d_q = n - 1;
 
-        // --- Round 1 commitments and shifts.
+        // --- Round 1 shifts and commitments.
         let n_u_shift = x_shift(&wit.n_u, big_d - strict_d_n_u);
         let t_u_shift = x_shift(&wit.t_u, big_d - strict_d_t_u);
         let n_v_shift = x_shift(&wit.n_v, big_d - strict_d_n_v);
         let t_v_shift = x_shift(&wit.t_v, big_d - strict_d_t_v);
-        let w_shift = x_shift(&w_poly, big_d - strict_d_w);
+        let w_a_shift = x_shift(&w_a_poly, big_d - strict_d_w);
+        let w_b_shift = x_shift(&w_b_poly, big_d - strict_d_w);
+        let w_c_shift = x_shift(&w_c_poly, big_d - strict_d_w);
 
-        let c_w = pc::commit(srs, &Poly::Sparse(w_poly.clone()));
-        let c_w_shift = pc::commit(srs, &Poly::Sparse(w_shift.clone()));
+        let c_w_a = pc::commit(srs, &Poly::Sparse(w_a_poly.clone()));
+        let c_w_b = pc::commit(srs, &Poly::Sparse(w_b_poly.clone()));
+        let c_w_c = pc::commit(srs, &Poly::Sparse(w_c_poly.clone()));
+        let c_w_a_shift = pc::commit(srs, &Poly::Sparse(w_a_shift.clone()));
+        let c_w_b_shift = pc::commit(srs, &Poly::Sparse(w_b_shift.clone()));
+        let c_w_c_shift = pc::commit(srs, &Poly::Sparse(w_c_shift.clone()));
         let c_n_u_shift = pc::commit(srs, &Poly::Sparse(n_u_shift.clone()));
         let c_t_u_shift = pc::commit(srs, &Poly::Sparse(t_u_shift.clone()));
         let c_n_v_shift = pc::commit(srs, &Poly::Sparse(n_v_shift.clone()));
         let c_t_v_shift = pc::commit(srs, &Poly::Sparse(t_v_shift.clone()));
 
-        transcript.absorb(b"rok_p::c_w", &c_w);
-        transcript.absorb(b"rok_p::c_w_shift", &c_w_shift);
+        transcript.absorb(b"rok_p::c_w_a", &c_w_a);
+        transcript.absorb(b"rok_p::c_w_b", &c_w_b);
+        transcript.absorb(b"rok_p::c_w_c", &c_w_c);
+        transcript.absorb(b"rok_p::c_w_a_shift", &c_w_a_shift);
+        transcript.absorb(b"rok_p::c_w_b_shift", &c_w_b_shift);
+        transcript.absorb(b"rok_p::c_w_c_shift", &c_w_c_shift);
         transcript.absorb(b"rok_p::c_n_u_shift", &c_n_u_shift);
         transcript.absorb(b"rok_p::c_t_u_shift", &c_t_u_shift);
         transcript.absorb(b"rok_p::c_n_v_shift", &c_n_v_shift);
@@ -120,21 +144,57 @@ impl RokP {
         let alpha: Fr = transcript.squeeze_field(b"rok_p::alpha");
         let eta: Fr = transcript.squeeze_field(b"rok_p::eta");
 
-        // --- Build g''(X) and decompose it for the sumcheck.
+        // --- Build G(X) and decompose for the sumcheck.
         let lambda_alpha_vec = dom.evaluate_all_lagrange_coefficients(alpha);
         let lambda_alpha_poly = ifft_sparse(&dom, &lambda_alpha_vec);
-        let m_alpha_vec = m_evaluated_at_alpha(&params.matrix, &lambda_alpha_vec, n);
-        let m_alpha_poly = ifft_sparse(&dom, &m_alpha_vec);
 
-        let uw = u_poly.mul(&w_poly);
-        let lambda_w = lambda_alpha_poly.mul(&w_poly);
-        let m_alpha_v = m_alpha_poly.mul(&v_poly);
-        // g(X) = Λ(α,X)·w(X) − M(α,X)·v(X)
-        let g_poly = &lambda_w + &(&m_alpha_v * -Fr::one());
-        // g''(X) = u·w + η·g
-        let g_pp = &uw + &(&g_poly * eta);
+        // Per-matrix column-evaluated polynomials M_X(α, ·).
+        let m_a_alpha_poly = ifft_sparse(
+            &dom,
+            &m_evaluated_at_alpha(&params.matrix_a, &lambda_alpha_vec, n),
+        );
+        let m_b_alpha_poly = ifft_sparse(
+            &dom,
+            &m_evaluated_at_alpha(&params.matrix_b, &lambda_alpha_vec, n),
+        );
+        let m_c_alpha_poly = ifft_sparse(
+            &dom,
+            &m_evaluated_at_alpha(&params.matrix_c, &lambda_alpha_vec, n),
+        );
 
-        let (q0_poly, q1_poly) = sumcheck_decompose(&g_pp, stmt.value / n_fr, n);
+        // g_X(X) = u(X)·w_X(X)                       — sum = y_X
+        // g'_X(X) = Λ(α,X)·w_X(X) − M_X(α,X)·v(X)    — sum = 0
+        let g_a = u_poly.mul(&w_a_poly);
+        let g_b = u_poly.mul(&w_b_poly);
+        let g_c = u_poly.mul(&w_c_poly);
+        let lam_a = lambda_alpha_poly.mul(&w_a_poly);
+        let lam_b = lambda_alpha_poly.mul(&w_b_poly);
+        let lam_c = lambda_alpha_poly.mul(&w_c_poly);
+        let mv_a = m_a_alpha_poly.mul(&v_poly);
+        let mv_b = m_b_alpha_poly.mul(&v_poly);
+        let mv_c = m_c_alpha_poly.mul(&v_poly);
+        let g_p_a = &lam_a + &(&mv_a * -Fr::one());
+        let g_p_b = &lam_b + &(&mv_b * -Fr::one());
+        let g_p_c = &lam_c + &(&mv_c * -Fr::one());
+
+        // G(X) = g_A + η·g_B + η²·g_C + η³·g'_A + η⁴·g'_B + η⁵·g'_C
+        let eta2 = eta * eta;
+        let eta3 = eta2 * eta;
+        let eta4 = eta3 * eta;
+        let eta5 = eta4 * eta;
+        let big_g = {
+            let mut acc = g_a;
+            acc = &acc + &(&g_b * eta);
+            acc = &acc + &(&g_c * eta2);
+            acc = &acc + &(&g_p_a * eta3);
+            acc = &acc + &(&g_p_b * eta4);
+            acc = &acc + &(&g_p_c * eta5);
+            acc
+        };
+
+        // Combined sumcheck value y_comb_sum = y_A + η·y_B + η²·y_C.
+        let y_comb_sum = stmt.y_a + eta * stmt.y_b + eta2 * stmt.y_c;
+        let (q0_poly, q1_poly) = sumcheck_decompose(&big_g, y_comb_sum / n_fr, n);
 
         let q0_shift = x_shift(&q0_poly, big_d - strict_d_q);
         let q1_shift = x_shift(&q1_poly, big_d - strict_d_q);
@@ -157,33 +217,40 @@ impl RokP {
         let ev_t_u = wit.t_u.evaluate(&beta);
         let ev_n_v = wit.n_v.evaluate(&beta);
         let ev_t_v = wit.t_v.evaluate(&beta);
-        let ev_w = w_poly.evaluate(&beta);
+        let ev_w_a = w_a_poly.evaluate(&beta);
+        let ev_w_b = w_b_poly.evaluate(&beta);
+        let ev_w_c = w_c_poly.evaluate(&beta);
         let ev_q0 = q0_poly.evaluate(&beta);
         let ev_q1 = q1_poly.evaluate(&beta);
 
-        // μ = M(α, β) = λ(α)ᵀ·M·λ(β).
+        // μ_X = M_X(α, β) = λ(α)ᵀ·X·λ(β).
         let lambda_beta_vec = dom.evaluate_all_lagrange_coefficients(beta);
-        let mu: Fr = params
-            .matrix
-            .iter()
-            .map(|&(i, j, m_ij)| m_ij * lambda_alpha_vec[i] * lambda_beta_vec[j])
-            .sum();
+        let mu_a = mu_at(&params.matrix_a, &lambda_alpha_vec, &lambda_beta_vec);
+        let mu_b = mu_at(&params.matrix_b, &lambda_alpha_vec, &lambda_beta_vec);
+        let mu_c = mu_at(&params.matrix_c, &lambda_alpha_vec, &lambda_beta_vec);
+        // Combined claim shipped to R_P (and used by the verifier in G(β)).
+        let y_combined = mu_a + eta * mu_b + eta2 * mu_c;
 
         // --- Batched polynomial and the corresponding commitment / value.
         let polys = [
             &wit.n_u, &wit.t_u, &wit.n_v, &wit.t_v,
-            &w_poly, &q0_poly, &q1_poly,
+            &w_a_poly, &w_b_poly, &w_c_poly,
+            &q0_poly, &q1_poly,
             &n_u_shift, &t_u_shift, &n_v_shift, &t_v_shift,
-            &w_shift, &q0_shift, &q1_shift,
+            &w_a_shift, &w_b_shift, &w_c_shift,
+            &q0_shift, &q1_shift,
         ];
         let commits = [
             stmt.c_n_u, stmt.c_t_u, stmt.c_n_v, stmt.c_t_v,
-            c_w, c_q0, c_q1,
+            c_w_a, c_w_b, c_w_c,
+            c_q0, c_q1,
             c_n_u_shift, c_t_u_shift, c_n_v_shift, c_t_v_shift,
-            c_w_shift, c_q0_shift, c_q1_shift,
+            c_w_a_shift, c_w_b_shift, c_w_c_shift,
+            c_q0_shift, c_q1_shift,
         ];
         let evals = batched_evals(
-            beta, ev_n_u, ev_t_u, ev_n_v, ev_t_v, ev_w, ev_q0, ev_q1,
+            beta, ev_n_u, ev_t_u, ev_n_v, ev_t_v,
+            ev_w_a, ev_w_b, ev_w_c, ev_q0, ev_q1,
             big_d, strict_d_n_u, strict_d_t_u, strict_d_n_v, strict_d_t_v,
             strict_d_w, strict_d_q,
         );
@@ -203,14 +270,18 @@ impl RokP {
             pc::prove(srs, &Poly::Sparse(p_batch.clone()), beta);
         debug_assert_eq!(opened_value, v_batch, "batched opening must match v_batch");
 
-        let p_stmt = PStatement { alpha, beta, y: mu };
+        let p_stmt = PStatement { alpha, beta, y: y_combined, eta };
         let pco_stmt = PcoStatement { commitment: c_batch, point: beta, value: v_batch };
         let pco_wit = PcoWitness { polynomial: p_batch };
         let proof = RokPProof {
-            c_w, c_w_shift, c_n_u_shift, c_t_u_shift, c_n_v_shift, c_t_v_shift,
+            c_w_a, c_w_b, c_w_c,
+            c_w_a_shift, c_w_b_shift, c_w_c_shift,
+            c_n_u_shift, c_t_u_shift, c_n_v_shift, c_t_v_shift,
             c_q0, c_q1, c_q0_shift, c_q1_shift,
-            ev_n_u, ev_t_u, ev_n_v, ev_t_v, ev_w, ev_q0, ev_q1,
-            mu,
+            ev_n_u, ev_t_u, ev_n_v, ev_t_v,
+            ev_w_a, ev_w_b, ev_w_c,
+            ev_q0, ev_q1,
+            y: y_combined,
             batched_opening,
         };
         (p_stmt, pco_stmt, pco_wit, proof)
@@ -218,8 +289,8 @@ impl RokP {
 
     /// Verifier side. Returns `None` if any check fails.
     pub fn verify(
-        params: &MParams,
-        stmt: &MStatement,
+        params: &AbcParams,
+        stmt: &AbcStatement,
         proof: &RokPProof,
         transcript: &mut Blake3Transcript,
     ) -> Option<(PStatement, PcoStatement)> {
@@ -228,10 +299,14 @@ impl RokP {
         let big_d = srs.powers_g1.len();
         let n_fr = Fr::from(n as u64);
 
-        absorb_m_statement(transcript, stmt);
+        absorb_abc_statement(transcript, stmt);
 
-        transcript.absorb(b"rok_p::c_w", &proof.c_w);
-        transcript.absorb(b"rok_p::c_w_shift", &proof.c_w_shift);
+        transcript.absorb(b"rok_p::c_w_a", &proof.c_w_a);
+        transcript.absorb(b"rok_p::c_w_b", &proof.c_w_b);
+        transcript.absorb(b"rok_p::c_w_c", &proof.c_w_c);
+        transcript.absorb(b"rok_p::c_w_a_shift", &proof.c_w_a_shift);
+        transcript.absorb(b"rok_p::c_w_b_shift", &proof.c_w_b_shift);
+        transcript.absorb(b"rok_p::c_w_c_shift", &proof.c_w_c_shift);
         transcript.absorb(b"rok_p::c_n_u_shift", &proof.c_n_u_shift);
         transcript.absorb(b"rok_p::c_t_u_shift", &proof.c_t_u_shift);
         transcript.absorb(b"rok_p::c_n_v_shift", &proof.c_n_v_shift);
@@ -248,37 +323,42 @@ impl RokP {
         let beta: Fr = transcript.squeeze_field(b"rok_p::beta");
         let eta_p: Fr = transcript.squeeze_field(b"rok_p::eta_p");
 
-        // Edge cases: T_u(β), T_v(β), and (β − α) must all be invertible.
+        // Edge cases.
         let t_u_n = n_fr * proof.ev_t_u;
         let t_v_n = n_fr * proof.ev_t_v;
         let t_u_n_inv = t_u_n.inverse()?;
         let t_v_n_inv = t_v_n.inverse()?;
         let beta_minus_alpha_inv = (beta - alpha).inverse()?;
+        let n_inv = n_fr.inverse()?;
 
         let u_at_beta = proof.ev_n_u * t_u_n_inv;
         let v_at_beta = proof.ev_n_v * t_v_n_inv;
 
-        // Λ(α, β) = ((β^n − 1)·α − (α^n − 1)·β) / (n·(β − α)).
         let beta_n = pow_usize(beta, n);
         let alpha_n = pow_usize(alpha, n);
         let lambda_alpha_beta =
             ((beta_n - Fr::one()) * alpha - (alpha_n - Fr::one()) * beta)
-                * (n_fr.inverse()? * beta_minus_alpha_inv);
+                * (n_inv * beta_minus_alpha_inv);
 
-        // g''(β) using μ in place of M(α, β).
-        let g_prime = u_at_beta * proof.ev_w;
-        let g_at_beta = lambda_alpha_beta * proof.ev_w - proof.mu * v_at_beta;
-        let g_pp_at_beta = g_prime + eta * g_at_beta;
+        // G(β) = [u(β) + η³·Λ(α,β)]·ev_W − v(β)·η³·proof.y
+        // where ev_W = ev_w_a + η·ev_w_b + η²·ev_w_c.
+        let eta2 = eta * eta;
+        let eta3 = eta2 * eta;
+        let ev_w = proof.ev_w_a + eta * proof.ev_w_b + eta2 * proof.ev_w_c;
+        let g_at_beta =
+            (u_at_beta + eta3 * lambda_alpha_beta) * ev_w
+                - v_at_beta * eta3 * proof.y;
 
-        // Sumcheck identity at β: g''(β) ?= y/n + β·q_0(β) + (β^n − 1)·q_1(β).
-        let rhs = stmt.value * n_fr.inverse()?
+        // Sumcheck identity at β: G(β) ?= (y_A + η·y_B + η²·y_C)/n + β·q0(β) + (β^n − 1)·q1(β).
+        let y_combined_sum = stmt.y_a + eta * stmt.y_b + eta2 * stmt.y_c;
+        let rhs = y_combined_sum * n_inv
             + beta * proof.ev_q0
             + (beta_n - Fr::one()) * proof.ev_q1;
-        if g_pp_at_beta != rhs {
+        if g_at_beta != rhs {
             return None;
         }
 
-        // Reconstruct the batched commitment and value.
+        // Reconstruct batched commitment and value.
         let strict_d_n_u = stmt.d_n_u + 1;
         let strict_d_t_u = stmt.d_t_u + 1;
         let strict_d_n_v = stmt.d_n_v + 1;
@@ -288,15 +368,17 @@ impl RokP {
 
         let evals = batched_evals(
             beta, proof.ev_n_u, proof.ev_t_u, proof.ev_n_v, proof.ev_t_v,
-            proof.ev_w, proof.ev_q0, proof.ev_q1,
+            proof.ev_w_a, proof.ev_w_b, proof.ev_w_c, proof.ev_q0, proof.ev_q1,
             big_d, strict_d_n_u, strict_d_t_u, strict_d_n_v, strict_d_t_v,
             strict_d_w, strict_d_q,
         );
         let commits = [
             stmt.c_n_u, stmt.c_t_u, stmt.c_n_v, stmt.c_t_v,
-            proof.c_w, proof.c_q0, proof.c_q1,
+            proof.c_w_a, proof.c_w_b, proof.c_w_c,
+            proof.c_q0, proof.c_q1,
             proof.c_n_u_shift, proof.c_t_u_shift, proof.c_n_v_shift, proof.c_t_v_shift,
-            proof.c_w_shift, proof.c_q0_shift, proof.c_q1_shift,
+            proof.c_w_a_shift, proof.c_w_b_shift, proof.c_w_c_shift,
+            proof.c_q0_shift, proof.c_q1_shift,
         ];
 
         let mut c_batch = Comm::zero();
@@ -312,7 +394,7 @@ impl RokP {
             return None;
         }
 
-        let p_stmt = PStatement { alpha, beta, y: proof.mu };
+        let p_stmt = PStatement { alpha, beta, y: proof.y, eta };
         let pco_stmt = PcoStatement { commitment: c_batch, point: beta, value: v_batch };
         Some((p_stmt, pco_stmt))
     }
@@ -343,6 +425,18 @@ fn m_evaluated_at_alpha(
     out
 }
 
+/// `μ = λ(α)ᵀ·M·λ(β) = Σ_{(i,j,m_ij) ∈ M} m_ij · L_i(α) · L_j(β)`.
+fn mu_at(
+    matrix: &[(usize, usize, Fr)],
+    lambda_alpha: &[Fr],
+    lambda_beta: &[Fr],
+) -> Fr {
+    matrix
+        .iter()
+        .map(|&(i, j, m_ij)| m_ij * lambda_alpha[i] * lambda_beta[j])
+        .sum()
+}
+
 fn ifft_sparse(dom: &Radix2EvaluationDomain<Fr>, evals: &[Fr]) -> SparsePolynomial<Fr> {
     let coeffs = dom.ifft(evals);
     vec_to_sparse(&coeffs)
@@ -368,17 +462,15 @@ fn sparse_to_dense_vec(p: &SparsePolynomial<Fr>, len: usize) -> Vec<Fr> {
     v
 }
 
-/// Decompose `g''(X) = y/n + X·q_0(X) + (X^n − 1)·q_1(X)`,
+/// Decompose `G(X) = y_combined/n + X·q_0(X) + (X^n − 1)·q_1(X)`,
 /// returning `(q_0, q_1)`. Both have degree ≤ n − 2.
 fn sumcheck_decompose(
-    g_pp: &SparsePolynomial<Fr>,
+    big_g: &SparsePolynomial<Fr>,
     y_over_n: Fr,
     n: usize,
 ) -> (SparsePolynomial<Fr>, SparsePolynomial<Fr>) {
-    // Materialize g'' as a dense coefficient vector of length 2n−1.
-    let c = sparse_to_dense_vec(g_pp, 2 * n - 1);
+    let c = sparse_to_dense_vec(big_g, 2 * n - 1);
 
-    // r[k] = c_k + c_{k+n} for k = 0..n-2, r[n-1] = c_{n-1}.
     let mut r = vec![Fr::zero(); n];
     for k in 0..(n - 1) {
         r[k] = c[k] + c[k + n];
@@ -386,9 +478,7 @@ fn sumcheck_decompose(
     r[n - 1] = c[n - 1];
     debug_assert_eq!(r[0], y_over_n, "sumcheck identity must hold");
 
-    // q_1[j] = c_{j+n} for j = 0..n−2.
     let q1: Vec<Fr> = (0..(n - 1)).map(|j| c[j + n]).collect();
-    // q_0[j] = r[j+1] for j = 0..n−2.
     let q0: Vec<Fr> = (0..(n - 1)).map(|j| r[j + 1]).collect();
 
     (vec_to_sparse(&q0), vec_to_sparse(&q1))
@@ -402,12 +492,13 @@ fn pow_usize(x: Fr, k: usize) -> Fr {
 fn batched_evals(
     beta: Fr,
     ev_n_u: Fr, ev_t_u: Fr, ev_n_v: Fr, ev_t_v: Fr,
-    ev_w: Fr, ev_q0: Fr, ev_q1: Fr,
+    ev_w_a: Fr, ev_w_b: Fr, ev_w_c: Fr,
+    ev_q0: Fr, ev_q1: Fr,
     big_d: usize,
     strict_d_n_u: usize, strict_d_t_u: usize,
     strict_d_n_v: usize, strict_d_t_v: usize,
     strict_d_w: usize, strict_d_q: usize,
-) -> [Fr; 14] {
+) -> [Fr; 18] {
     let s_n_u = pow_usize(beta, big_d - strict_d_n_u);
     let s_t_u = pow_usize(beta, big_d - strict_d_t_u);
     let s_n_v = pow_usize(beta, big_d - strict_d_n_v);
@@ -415,24 +506,29 @@ fn batched_evals(
     let s_w = pow_usize(beta, big_d - strict_d_w);
     let s_q = pow_usize(beta, big_d - strict_d_q);
     [
-        // unshifted (k = 0..6)
-        ev_n_u, ev_t_u, ev_n_v, ev_t_v, ev_w, ev_q0, ev_q1,
-        // shifted (k = 7..13)
+        // unshifted (k = 0..8)
+        ev_n_u, ev_t_u, ev_n_v, ev_t_v,
+        ev_w_a, ev_w_b, ev_w_c,
+        ev_q0, ev_q1,
+        // shifted (k = 9..17)
         s_n_u * ev_n_u, s_t_u * ev_t_u, s_n_v * ev_n_v, s_t_v * ev_t_v,
-        s_w * ev_w, s_q * ev_q0, s_q * ev_q1,
+        s_w * ev_w_a, s_w * ev_w_b, s_w * ev_w_c,
+        s_q * ev_q0, s_q * ev_q1,
     ]
 }
 
-fn absorb_m_statement(t: &mut Blake3Transcript, s: &MStatement) {
-    t.absorb(b"rok_p::m_c_n_u", &s.c_n_u);
-    t.absorb(b"rok_p::m_c_t_u", &s.c_t_u);
-    t.absorb(b"rok_p::m_c_n_v", &s.c_n_v);
-    t.absorb(b"rok_p::m_c_t_v", &s.c_t_v);
-    t.absorb_usize(b"rok_p::m_d_n_u", s.d_n_u);
-    t.absorb_usize(b"rok_p::m_d_t_u", s.d_t_u);
-    t.absorb_usize(b"rok_p::m_d_n_v", s.d_n_v);
-    t.absorb_usize(b"rok_p::m_d_t_v", s.d_t_v);
-    t.absorb(b"rok_p::m_y", &s.value);
+fn absorb_abc_statement(t: &mut Blake3Transcript, s: &AbcStatement) {
+    t.absorb(b"rok_p::abc_c_n_u", &s.c_n_u);
+    t.absorb(b"rok_p::abc_c_t_u", &s.c_t_u);
+    t.absorb(b"rok_p::abc_c_n_v", &s.c_n_v);
+    t.absorb(b"rok_p::abc_c_t_v", &s.c_t_v);
+    t.absorb_usize(b"rok_p::abc_d_n_u", s.d_n_u);
+    t.absorb_usize(b"rok_p::abc_d_t_u", s.d_t_u);
+    t.absorb_usize(b"rok_p::abc_d_n_v", s.d_n_v);
+    t.absorb_usize(b"rok_p::abc_d_t_v", s.d_t_v);
+    t.absorb(b"rok_p::abc_y_a", &s.y_a);
+    t.absorb(b"rok_p::abc_y_b", &s.y_b);
+    t.absorb(b"rok_p::abc_y_c", &s.y_c);
 }
 
 // ---------------------------------------------------------------------------
@@ -443,46 +539,29 @@ fn absorb_m_statement(t: &mut Blake3Transcript, s: &MStatement) {
 mod tests {
     use super::*;
     use crate::core::Relation;
-    use crate::relations::m::leaf_instance;
+    use crate::relations::abc::leaf_instance;
     use crate::relations::pco::{PcoParams, PcoRelation};
     use ark_ff::UniformRand;
     use ark_std::test_rng;
 
-    /// Random K×K identity-like leaf instance, with `srs` of capacity
-    /// large enough to accommodate `D ≥ 2n` for all degree binding.
-    fn identity_leaf(n: usize) -> (MParams, MStatement, MWitness) {
+    fn identity_leaf(n: usize) -> (AbcParams, AbcStatement, AbcWitness) {
         let rng = &mut test_rng();
-        let matrix: Vec<(usize, usize, Fr)> =
+        let a: Vec<(usize, usize, Fr)> =
             (0..n).map(|i| (i, i, Fr::from(1u64))).collect();
-        // SRS supports degrees up to (big_d - 1) = (2n + 4) - 1, i.e. D = 2n+4.
-        // Plenty of headroom for the shifts D - 1 < D.
+        let b: Vec<(usize, usize, Fr)> =
+            (0..n).map(|i| (i, (i + 1) % n, Fr::from(1u64))).collect();
+        let c: Vec<(usize, usize, Fr)> =
+            (0..n).map(|i| (i, i, Fr::rand(rng))).collect();
         let srs = pc::setup(2 * n + 3, rng);
-        let params = MParams { srs, matrix, n };
+        let params = AbcParams { srs, matrix_a: a, matrix_b: b, matrix_c: c, n };
         let alpha = Fr::rand(rng);
         let beta = Fr::rand(rng);
-        let (stmt, wit) = leaf_instance(&params, alpha, beta);
-        (params, stmt, wit)
-    }
-
-    /// Random sparse-but-non-identity matrix.
-    fn random_matrix_leaf(n: usize) -> (MParams, MStatement, MWitness) {
-        let rng = &mut test_rng();
-        // Sparse: each row has two non-zero entries.
-        let mut matrix: Vec<(usize, usize, Fr)> = Vec::new();
-        for i in 0..n {
-            matrix.push((i, i, Fr::rand(rng)));
-            matrix.push((i, (i + 1) % n, Fr::rand(rng)));
-        }
-        let srs = pc::setup(2 * n + 3, rng);
-        let params = MParams { srs, matrix, n };
-        let alpha = Fr::rand(rng);
-        let beta = Fr::rand(rng);
-        let (stmt, wit) = leaf_instance(&params, alpha, beta);
-        (params, stmt, wit)
+        let (s, w) = leaf_instance(&params, alpha, beta);
+        (params, s, w)
     }
 
     #[test]
-    fn roundtrip_identity_n4() {
+    fn roundtrip_n4() {
         let (params, stmt, wit) = identity_leaf(4);
         let mut t_p = Blake3Transcript::new(b"rok_p::test");
         let (p_p, pco_p, pco_wit, proof) =
@@ -495,13 +574,12 @@ mod tests {
         assert_eq!(p_p, p_v);
         assert_eq!(pco_p, pco_v);
 
-        // The emitted PCO instance, taken with its witness, satisfies R_PCO.
         let pco_params = PcoParams { srs: params.srs.clone() };
         assert!(PcoRelation::is_satisfied(&pco_params, &pco_p, &pco_wit));
     }
 
     #[test]
-    fn roundtrip_identity_n8() {
+    fn roundtrip_n8() {
         let (params, stmt, wit) = identity_leaf(8);
         let mut t_p = Blake3Transcript::new(b"rok_p::test");
         let (p_p, pco_p, pco_wit, proof) =
@@ -518,27 +596,11 @@ mod tests {
         assert!(PcoRelation::is_satisfied(&pco_params, &pco_p, &pco_wit));
     }
 
+    /// The emitted `PStatement.y` matches the explicit combined matrix
+    /// evaluation `P_A(α,β) + η·P_B(α,β) + η²·P_C(α,β)` computed from
+    /// the matrices and the squeezed `(α, β, η)`.
     #[test]
-    fn roundtrip_random_matrix() {
-        let (params, stmt, wit) = random_matrix_leaf(4);
-        let mut t_p = Blake3Transcript::new(b"rok_p::test");
-        let (p_p, _, pco_wit, proof) =
-            RokP::reduce(&params, &stmt, &wit, &mut t_p);
-
-        let mut t_v = Blake3Transcript::new(b"rok_p::test");
-        let (p_v, pco_v) =
-            RokP::verify(&params, &stmt, &proof, &mut t_v).expect("must verify");
-
-        assert_eq!(p_p, p_v);
-        let pco_params = PcoParams { srs: params.srs.clone() };
-        assert!(PcoRelation::is_satisfied(&pco_params, &pco_v, &pco_wit));
-    }
-
-    /// Sanity: the emitted `(α, β, μ)` satisfies the R_P relation
-    /// (i.e. `μ = λ(α)ᵀ·M·λ(β)`), checked manually since `p.rs` has
-    /// no `is_satisfied`.
-    #[test]
-    fn emitted_p_statement_is_correct() {
+    fn emitted_p_y_matches_combined_matrix_eval() {
         let (params, stmt, wit) = identity_leaf(4);
         let mut t_p = Blake3Transcript::new(b"rok_p::test");
         let (p_stmt, _, _, _) = RokP::reduce(&params, &stmt, &wit, &mut t_p);
@@ -546,55 +608,61 @@ mod tests {
         let dom = Radix2EvaluationDomain::<Fr>::new(params.n).unwrap();
         let lambda_alpha = dom.evaluate_all_lagrange_coefficients(p_stmt.alpha);
         let lambda_beta = dom.evaluate_all_lagrange_coefficients(p_stmt.beta);
-        let expected_mu: Fr = params
-            .matrix
-            .iter()
-            .map(|&(i, j, m_ij)| m_ij * lambda_alpha[i] * lambda_beta[j])
-            .sum();
-        assert_eq!(p_stmt.y, expected_mu);
+        let p_a = mu_at(&params.matrix_a, &lambda_alpha, &lambda_beta);
+        let p_b = mu_at(&params.matrix_b, &lambda_alpha, &lambda_beta);
+        let p_c = mu_at(&params.matrix_c, &lambda_alpha, &lambda_beta);
+        let expected = p_a + p_stmt.eta * p_b + p_stmt.eta * p_stmt.eta * p_c;
+        assert_eq!(p_stmt.y, expected);
     }
 
-    /// Tampering `m_stmt.value` between prove and verify must reject
-    /// (sumcheck identity no longer holds).
     #[test]
-    fn tampered_value_rejected() {
+    fn tampered_y_a_in_stmt_rejected() {
         let (params, stmt, wit) = identity_leaf(4);
         let mut t_p = Blake3Transcript::new(b"rok_p::test");
         let (_, _, _, proof) = RokP::reduce(&params, &stmt, &wit, &mut t_p);
 
         let mut bad_stmt = stmt.clone();
-        bad_stmt.value += Fr::from(1u64);
+        bad_stmt.y_a += Fr::from(1u64);
 
         let mut t_v = Blake3Transcript::new(b"rok_p::test");
         assert!(RokP::verify(&params, &bad_stmt, &proof, &mut t_v).is_none());
     }
 
-    /// Tampering `proof.mu` must reject.
     #[test]
-    fn tampered_mu_rejected() {
+    fn tampered_y_b_in_stmt_rejected() {
+        let (params, stmt, wit) = identity_leaf(4);
+        let mut t_p = Blake3Transcript::new(b"rok_p::test");
+        let (_, _, _, proof) = RokP::reduce(&params, &stmt, &wit, &mut t_p);
+
+        let mut bad_stmt = stmt.clone();
+        bad_stmt.y_b += Fr::from(1u64);
+
+        let mut t_v = Blake3Transcript::new(b"rok_p::test");
+        assert!(RokP::verify(&params, &bad_stmt, &proof, &mut t_v).is_none());
+    }
+
+    #[test]
+    fn tampered_proof_y_rejected() {
         let (params, stmt, wit) = identity_leaf(4);
         let mut t_p = Blake3Transcript::new(b"rok_p::test");
         let (_, _, _, mut proof) = RokP::reduce(&params, &stmt, &wit, &mut t_p);
-        proof.mu += Fr::from(1u64);
+        proof.y += Fr::from(1u64);
 
         let mut t_v = Blake3Transcript::new(b"rok_p::test");
         assert!(RokP::verify(&params, &stmt, &proof, &mut t_v).is_none());
     }
 
-    /// Tampering any unshifted evaluation in the proof must reject
-    /// (batched opening fails).
     #[test]
-    fn tampered_evaluation_rejected() {
+    fn tampered_ev_w_a_rejected() {
         let (params, stmt, wit) = identity_leaf(4);
         let mut t_p = Blake3Transcript::new(b"rok_p::test");
         let (_, _, _, mut proof) = RokP::reduce(&params, &stmt, &wit, &mut t_p);
-        proof.ev_w += Fr::from(1u64);
+        proof.ev_w_a += Fr::from(1u64);
 
         let mut t_v = Blake3Transcript::new(b"rok_p::test");
         assert!(RokP::verify(&params, &stmt, &proof, &mut t_v).is_none());
     }
 
-    /// Different transcript label between prover and verifier must reject.
     #[test]
     fn transcript_mismatch_rejected() {
         let (params, stmt, wit) = identity_leaf(4);

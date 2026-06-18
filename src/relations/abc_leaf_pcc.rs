@@ -9,9 +9,9 @@ use crate::relations::pcc::{
 };
 
 /// Build the per-verifier R_PCC instance that proves the leaf-encoding
-/// correctness of `(N_u, T_u, N_v, T_v)` for a leaf `(α, β)` of R_M.
+/// correctness of `(N_u, T_u, N_v, T_v)` for a leaf `(α, β)` of R_{A,B,C}.
 ///
-/// Witness polynomials (must match `m::leaf_instance`):
+/// Witness polynomials (must match `abc::leaf_instance`):
 /// ```text
 ///   N_u(X) = (X^n − 1)·α − (α^n − 1)·X       T_u(X) = X − α
 ///   N_v(X) = (X^n − 1)·β − (β^n − 1)·X       T_v(X) = X − β
@@ -26,6 +26,9 @@ use crate::relations::pcc::{
 /// ```
 ///
 /// Witness indices in the constraints: `Y_0 = N_u, Y_1 = T_u, Y_2 = N_v, Y_3 = T_v`.
+///
+/// Note: matrix-independent — same shape works for every leaf regardless of
+/// which `(A, B, C)` the R_{A,B,C} instance is over.
 pub fn leaf_correctness_pcc(
     params: &PccParams,
     n: usize,
@@ -92,21 +95,21 @@ pub fn leaf_correctness_pcc(
     (stmt, wit)
 }
 
-/// Glue helper: given the K × κ R_PCC bundle MFold emitted and the K per-leaf
-/// challenges, append each leaf's correctness R_PCC instance so the result is
-/// K × (κ+1). Correctness goes last in each inner vec.
+/// Glue helper: given the K × κ R_PCC bundle `AbcFold` emitted and the K
+/// per-leaf challenges, append each leaf's correctness R_PCC instance so
+/// the result is K × (κ+1). Correctness goes last in each inner vec.
 pub fn full_pcc_bundles(
     params: &PccParams,
     n: usize,
     leaf_challenges: &[(Fr, Fr)],
-    mfold_pcc_bundles: Vec<Vec<(PccStatement, PccWitness)>>,
+    fold_pcc_bundles: Vec<Vec<(PccStatement, PccWitness)>>,
 ) -> Vec<Vec<(PccStatement, PccWitness)>> {
     assert_eq!(
         leaf_challenges.len(),
-        mfold_pcc_bundles.len(),
-        "leaf_challenges and mfold_pcc_bundles must have matching outer length K",
+        fold_pcc_bundles.len(),
+        "leaf_challenges and fold_pcc_bundles must have matching outer length K",
     );
-    mfold_pcc_bundles
+    fold_pcc_bundles
         .into_iter()
         .zip(leaf_challenges)
         .map(|(mut bundle, &(alpha, beta))| {
@@ -154,7 +157,6 @@ mod tests {
         assert!(PccRelation::is_satisfied(&p, &s, &w));
     }
 
-    /// Constraint built with a wrong α must reject the right witness.
     #[test]
     fn wrong_alpha_in_constraint_rejected() {
         let n = 4;
@@ -163,14 +165,12 @@ mod tests {
         let alpha = Fr::rand(rng);
         let beta = Fr::rand(rng);
         let (mut s, w) = leaf_correctness_pcc(&p, n, alpha, beta);
-        // Re-build the constraints using α' ≠ α; commitments/witness untouched.
         let alpha_prime = alpha + Fr::from(1u64);
         let (s_bad, _) = leaf_correctness_pcc(&p, n, alpha_prime, beta);
         s.constraints[0] = s_bad.constraints[0].clone();
         assert!(!PccRelation::is_satisfied(&p, &s, &w));
     }
 
-    /// Tampering with T_u (replace with X − α + 1) must reject.
     #[test]
     fn tampered_t_u_rejected() {
         let n = 4;
@@ -188,8 +188,6 @@ mod tests {
         assert!(!PccRelation::is_satisfied(&p, &s, &w));
     }
 
-    /// Degree-bound sanity: N_u has degree exactly n, so the strict bound n+1
-    /// is tight — lowering it to n must reject.
     #[test]
     fn tight_degree_bound_rejected_when_loosened() {
         let n = 4;
@@ -198,12 +196,10 @@ mod tests {
         let alpha = Fr::rand(rng);
         let beta = Fr::rand(rng);
         let (mut s, w) = leaf_correctness_pcc(&p, n, alpha, beta);
-        s.degrees[0] = n; // claim deg N_u < n, but actually deg N_u = n
+        s.degrees[0] = n;
         assert!(!PccRelation::is_satisfied(&p, &s, &w));
     }
 
-    /// `full_pcc_bundles` must append exactly one correctness instance per leaf
-    /// and preserve the existing inner entries in order.
     #[test]
     fn full_pcc_bundles_appends_in_order() {
         let n = 4;
@@ -213,10 +209,7 @@ mod tests {
         let challenges: Vec<(Fr, Fr)> =
             (0..k).map(|_| (Fr::rand(rng), Fr::rand(rng))).collect();
 
-        // Fake per-leaf MFold bundle: a single dummy entry with an empty
-        // PccStatement and empty PccWitness. Distinct degrees field per leaf
-        // lets us check ordering survives.
-        let mfold: Vec<Vec<(PccStatement, PccWitness)>> = (0..k)
+        let fold: Vec<Vec<(PccStatement, PccWitness)>> = (0..k)
             .map(|leaf| {
                 vec![(
                     PccStatement {
@@ -229,13 +222,11 @@ mod tests {
             })
             .collect();
 
-        let out = full_pcc_bundles(&p, n, &challenges, mfold);
+        let out = full_pcc_bundles(&p, n, &challenges, fold);
         assert_eq!(out.len(), k);
         for (leaf, bundle) in out.iter().enumerate() {
             assert_eq!(bundle.len(), 2);
-            // Original dummy stays at index 0.
             assert_eq!(bundle[0].0.degrees, vec![leaf]);
-            // Correctness PCC instance at index 1 satisfies R_PCC.
             assert!(PccRelation::is_satisfied(&p, &bundle[1].0, &bundle[1].1));
         }
     }

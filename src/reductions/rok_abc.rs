@@ -1,76 +1,74 @@
 use ark_bls12_381::Fr;
 
 use crate::pc::{self, Comm, Poly};
-use crate::relations::m::{MParams, MStatement, MWitness};
+use crate::relations::abc::{bilinear, AbcParams, AbcStatement, AbcWitness};
 use crate::relations::pcc::{Constraint, Monomial, PccStatement, PccWitness};
 use crate::transcript::Blake3Transcript;
 
-/// The non-interactive reduction of knowledge `Π_M : R_M² → R_M × R_PCC`
-/// (Fiat-Shamir transform of the public-coin protocol in Sec. 8 / Fig.
-/// `rok_pcss` of the paper, applied per Sec. `fs_rok`).
+/// `Π_{ABC} : R_{A,B,C}² → R_{A,B,C} × R_PCC` — the per-fold reduction
+/// extended to three matrices `(A, B, C)`.
 ///
-/// Folds two `R_M` instances `(s_b, w_b)_{b∈{0,1}}` into one new `R_M`
-/// instance plus an `R_PCC` "promise" that witnesses the algebraic
-/// relationship between the new committed polynomials and the originals.
-/// The challenge `γ` is derived from the transcript: prover and verifier
-/// each absorb `(s_0, s_1, z)` and squeeze the same `γ`.
-pub struct RokM;
+/// The N/T side (rational encoding of `u, v`) is identical to the single-
+/// matrix `Π_M` reduction: matrix-independent products and a single γ.
+/// What changes is the value side — instead of one cross-term `z` and one
+/// folded `y*`, we emit three of each (`z_A, z_B, z_C` and `y_A*, y_B*,
+/// y_C*`), with the same `γ` weighting them.
+pub struct RokAbc;
 
 /// What the prover sends to the verifier.
 #[derive(Clone)]
-pub struct RokMProof {
-    /// `z = u_0ᵀ M v_1 + u_1ᵀ M v_0` — the cross-term used in the new value.
-    pub z: Fr,
+pub struct RokAbcProof {
+    /// Cross-terms `z_X = u_0ᵀ·X·v_1 + u_1ᵀ·X·v_0` for `X ∈ {A, B, C}`.
+    pub z_a: Fr,
+    pub z_b: Fr,
+    pub z_c: Fr,
     pub c_n_u_star: Comm,
     pub c_t_u_star: Comm,
     pub c_n_v_star: Comm,
     pub c_t_v_star: Comm,
 }
 
-impl RokM {
-    /// Prover side. Returns the proof, the new `R_M` instance, and the
-    /// `R_PCC` promise instance, each as a `(statement, witness)` pair.
-    /// The challenge `γ` is derived from `transcript` after absorbing the
-    /// public inputs and the prover's first message `z`.
+impl RokAbc {
+    /// Prover side. Returns the proof, the folded R_{A,B,C} instance, and
+    /// the R_PCC promise.
     pub fn reduce(
-        params: &MParams,
-        s0: &MStatement,
-        w0: &MWitness,
-        s1: &MStatement,
-        w1: &MWitness,
+        params: &AbcParams,
+        s0: &AbcStatement,
+        w0: &AbcWitness,
+        s1: &AbcStatement,
+        w1: &AbcWitness,
         transcript: &mut Blake3Transcript,
     ) -> (
-        RokMProof,
-        (MStatement, MWitness),
+        RokAbcProof,
+        (AbcStatement, AbcWitness),
         (PccStatement, PccWitness),
     ) {
-        // FS round 0: absorb the public inputs (the two M statements).
-        absorb_m_statement(transcript, b"s0", s0);
-        absorb_m_statement(transcript, b"s1", s1);
+        absorb_abc_statement(transcript, b"s0", s0);
+        absorb_abc_statement(transcript, b"s1", s1);
 
-        // 1. Cross-term  z = u_0ᵀ M v_1 + u_1ᵀ M v_0  (prover's round-1 msg).
-        let z = bilinear(&params.matrix, &w0.u, &w1.v)
-            + bilinear(&params.matrix, &w1.u, &w0.v);
-        transcript.absorb(b"z", &z);
+        // 1. Cross-terms, one per matrix.
+        let z_a = bilinear(&params.matrix_a, &w0.u, &w1.v)
+            + bilinear(&params.matrix_a, &w1.u, &w0.v);
+        let z_b = bilinear(&params.matrix_b, &w0.u, &w1.v)
+            + bilinear(&params.matrix_b, &w1.u, &w0.v);
+        let z_c = bilinear(&params.matrix_c, &w0.u, &w1.v)
+            + bilinear(&params.matrix_c, &w1.u, &w0.v);
+        transcript.absorb(b"z_a", &z_a);
+        transcript.absorb(b"z_b", &z_b);
+        transcript.absorb(b"z_c", &z_c);
 
-        // FS challenge: γ depends on (s_0, s_1, z).
+        // FS challenge.
         let gamma: Fr = transcript.squeeze_field(b"gamma");
 
-        // 2. New polynomials.
-        //    N_u* = N_{u,0}·T_{u,1} + γ · N_{u,1}·T_{u,0}
-        //    T_u* = T_{u,0}·T_{u,1}
-        //
-        // Note: we deliberately avoid arkworks' `AddAssign<(F, &Self)>` impl on
-        // SparsePolynomial — in 0.4.2 it computes `f · (self + other)` rather
-        // than `self + f · other` (the result coefficients are scaled
-        // unconditionally, see ark-poly src/.../univariate/sparse.rs:169).
+        // 2. N/T folding — identical to Π_M (matrix-independent).
+        // Workaround for arkworks 0.4.2 AddAssign<(F, &SparsePolynomial)> bug:
+        // multiply first, then add.
         let n_u_star = &w0.n_u.mul(&w1.t_u) + &(&w1.n_u.mul(&w0.t_u) * gamma);
         let t_u_star = w0.t_u.mul(&w1.t_u);
-
         let n_v_star = &w0.n_v.mul(&w1.t_v) + &(&w1.n_v.mul(&w0.t_v) * gamma);
         let t_v_star = w0.t_v.mul(&w1.t_v);
 
-        // 3. New vectors:  u* = u_0 + γ u_1,  v* = v_0 + γ v_1.
+        // 3. Folded u*, v*.
         let u_star: Vec<Fr> =
             w0.u.iter().zip(&w1.u).map(|(a, b)| *a + gamma * *b).collect();
         let v_star: Vec<Fr> =
@@ -82,14 +80,16 @@ impl RokM {
         let c_n_v_star = pc::commit(&params.srs, &Poly::Sparse(n_v_star.clone()));
         let c_t_v_star = pc::commit(&params.srs, &Poly::Sparse(t_v_star.clone()));
 
-        // 5. New degree bounds.
+        // 5. Folded degrees (same as Π_M).
         let (d_n_u_star, d_t_u_star, d_n_v_star, d_t_v_star) = star_degrees(s0, s1);
 
-        // 6. y* = y_0 + γ z + γ² y_1.
-        let y_star = s0.value + gamma * z + gamma * gamma * s1.value;
+        // 6. Folded values, one per matrix.
+        let gamma_sq = gamma * gamma;
+        let y_a_star = s0.y_a + gamma * z_a + gamma_sq * s1.y_a;
+        let y_b_star = s0.y_b + gamma * z_b + gamma_sq * s1.y_b;
+        let y_c_star = s0.y_c + gamma * z_c + gamma_sq * s1.y_c;
 
-        // 7. Output `R_M` (statement, witness).
-        let out_m_stmt = MStatement {
+        let out_abc_stmt = AbcStatement {
             c_n_u: c_n_u_star,
             c_t_u: c_t_u_star,
             c_n_v: c_n_v_star,
@@ -98,9 +98,11 @@ impl RokM {
             d_t_u: d_t_u_star,
             d_n_v: d_n_v_star,
             d_t_v: d_t_v_star,
-            value: y_star,
+            y_a: y_a_star,
+            y_b: y_b_star,
+            y_c: y_c_star,
         };
-        let out_m_wit = MWitness {
+        let out_abc_wit = AbcWitness {
             n_u: n_u_star.clone(),
             t_u: t_u_star.clone(),
             u: u_star,
@@ -109,7 +111,7 @@ impl RokM {
             v: v_star,
         };
 
-        // 8. Output `R_PCC` (statement, witness).
+        // 7. R_PCC promise (matrix-independent — same shape as Π_M).
         let out_pcc_stmt = build_pcc_statement(
             s0,
             s1,
@@ -134,45 +136,43 @@ impl RokM {
             ],
         };
 
-        let proof = RokMProof {
-            z,
+        let proof = RokAbcProof {
+            z_a,
+            z_b,
+            z_c,
             c_n_u_star,
             c_t_u_star,
             c_n_v_star,
             c_t_v_star,
         };
 
-        // Absorb the prover's round-2 messages so the transcript is in a
-        // well-defined state for any downstream composition.
         absorb_proof_round2(transcript, &proof);
 
-        (proof, (out_m_stmt, out_m_wit), (out_pcc_stmt, out_pcc_wit))
+        (proof, (out_abc_stmt, out_abc_wit), (out_pcc_stmt, out_pcc_wit))
     }
 
-    /// Verifier side. Reconstructs the two output statements deterministically
-    /// from the input statements and the proof. The challenge `γ` is derived
-    /// from `transcript` (which must mirror the prover's transcript state) by
-    /// absorbing `(s_0, s_1, z)` and squeezing.
-    ///
-    /// There is no boolean to return — soundness comes from the *next* layer
-    /// (calling `is_satisfied` on the reconstructed `R_M` and `R_PCC`
-    /// statements against whichever witnesses are eventually produced).
+    /// Verifier side. Reconstructs the folded R_{A,B,C} statement and the
+    /// R_PCC promise from the proof.
     pub fn verify(
-        s0: &MStatement,
-        s1: &MStatement,
-        proof: &RokMProof,
+        s0: &AbcStatement,
+        s1: &AbcStatement,
+        proof: &RokAbcProof,
         transcript: &mut Blake3Transcript,
-    ) -> (MStatement, PccStatement) {
-        // Mirror the prover's FS absorbs to derive the same γ.
-        absorb_m_statement(transcript, b"s0", s0);
-        absorb_m_statement(transcript, b"s1", s1);
-        transcript.absorb(b"z", &proof.z);
+    ) -> (AbcStatement, PccStatement) {
+        absorb_abc_statement(transcript, b"s0", s0);
+        absorb_abc_statement(transcript, b"s1", s1);
+        transcript.absorb(b"z_a", &proof.z_a);
+        transcript.absorb(b"z_b", &proof.z_b);
+        transcript.absorb(b"z_c", &proof.z_c);
         let gamma: Fr = transcript.squeeze_field(b"gamma");
 
         let (d_n_u_star, d_t_u_star, d_n_v_star, d_t_v_star) = star_degrees(s0, s1);
-        let y_star = s0.value + gamma * proof.z + gamma * gamma * s1.value;
+        let gamma_sq = gamma * gamma;
+        let y_a_star = s0.y_a + gamma * proof.z_a + gamma_sq * s1.y_a;
+        let y_b_star = s0.y_b + gamma * proof.z_b + gamma_sq * s1.y_b;
+        let y_c_star = s0.y_c + gamma * proof.z_c + gamma_sq * s1.y_c;
 
-        let out_m_stmt = MStatement {
+        let out_abc_stmt = AbcStatement {
             c_n_u: proof.c_n_u_star,
             c_t_u: proof.c_t_u_star,
             c_n_v: proof.c_n_v_star,
@@ -181,7 +181,9 @@ impl RokM {
             d_t_u: d_t_u_star,
             d_n_v: d_n_v_star,
             d_t_v: d_t_v_star,
-            value: y_star,
+            y_a: y_a_star,
+            y_b: y_b_star,
+            y_c: y_c_star,
         };
         let out_pcc_stmt = build_pcc_statement(
             s0,
@@ -196,10 +198,9 @@ impl RokM {
             gamma,
         );
 
-        // Mirror the prover's round-2 absorbs.
         absorb_proof_round2(transcript, proof);
 
-        (out_m_stmt, out_pcc_stmt)
+        (out_abc_stmt, out_pcc_stmt)
     }
 }
 
@@ -207,17 +208,8 @@ impl RokM {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn bilinear(matrix: &[(usize, usize, Fr)], u: &[Fr], v: &[Fr]) -> Fr {
-    matrix
-        .iter()
-        .map(|&(i, j, m_ij)| m_ij * u[i] * v[j])
-        .sum()
-}
-
-/// Absorb an `MStatement` into the FS transcript with a section tag (so
-/// `s_0` and `s_1` are distinguishable in the absorbed bytes).
-fn absorb_m_statement(t: &mut Blake3Transcript, tag: &'static [u8], s: &MStatement) {
-    t.absorb_bytes(b"m_stmt::tag", tag);
+fn absorb_abc_statement(t: &mut Blake3Transcript, tag: &'static [u8], s: &AbcStatement) {
+    t.absorb_bytes(b"abc_stmt::tag", tag);
     t.absorb(b"c_n_u", &s.c_n_u);
     t.absorb(b"c_t_u", &s.c_t_u);
     t.absorb(b"c_n_v", &s.c_n_v);
@@ -226,20 +218,19 @@ fn absorb_m_statement(t: &mut Blake3Transcript, tag: &'static [u8], s: &MStateme
     t.absorb_usize(b"d_t_u", s.d_t_u);
     t.absorb_usize(b"d_n_v", s.d_n_v);
     t.absorb_usize(b"d_t_v", s.d_t_v);
-    t.absorb(b"value", &s.value);
+    t.absorb(b"y_a", &s.y_a);
+    t.absorb(b"y_b", &s.y_b);
+    t.absorb(b"y_c", &s.y_c);
 }
 
-/// Absorb the prover's round-2 message (the four new commitments). Done
-/// after `γ` is squeezed so the transcript carries the full transcript
-/// state for downstream composition.
-fn absorb_proof_round2(t: &mut Blake3Transcript, p: &RokMProof) {
+fn absorb_proof_round2(t: &mut Blake3Transcript, p: &RokAbcProof) {
     t.absorb(b"c_n_u_star", &p.c_n_u_star);
     t.absorb(b"c_t_u_star", &p.c_t_u_star);
     t.absorb(b"c_n_v_star", &p.c_n_v_star);
     t.absorb(b"c_t_v_star", &p.c_t_v_star);
 }
 
-fn star_degrees(s0: &MStatement, s1: &MStatement) -> (usize, usize, usize, usize) {
+fn star_degrees(s0: &AbcStatement, s1: &AbcStatement) -> (usize, usize, usize, usize) {
     let d_n_u_star = (s0.d_n_u + s1.d_t_u).max(s1.d_n_u + s0.d_t_u);
     let d_t_u_star = s0.d_t_u + s1.d_t_u;
     let d_n_v_star = (s0.d_n_v + s1.d_t_v).max(s1.d_n_v + s0.d_t_v);
@@ -247,19 +238,15 @@ fn star_degrees(s0: &MStatement, s1: &MStatement) -> (usize, usize, usize, usize
     (d_n_u_star, d_t_u_star, d_n_v_star, d_t_v_star)
 }
 
-/// Build the `R_PCC` statement that promises:
-///   N_u* = N_{u,0}·T_{u,1} + γ · N_{u,1}·T_{u,0}
-///   N_v* = N_{v,0}·T_{v,1} + γ · N_{v,1}·T_{v,0}
-///   T_u* = T_{u,0}·T_{u,1}
-///   T_v* = T_{v,0}·T_{v,1}
-///
-/// Polynomial-index convention used in `Q`:
+/// Build the R_PCC statement that promises the folded N/T polynomials
+/// match the per-matrix combination of the inputs. Same shape as in `Π_M`
+/// — index convention:
 ///   0 = N_u*    1 = T_u*    2 = N_v*    3 = T_v*
 ///   4 = N_{u,0} 5 = T_{u,0} 6 = N_{v,0} 7 = T_{v,0}
 ///   8 = N_{u,1} 9 = T_{u,1} 10 = N_{v,1} 11 = T_{v,1}
 fn build_pcc_statement(
-    s0: &MStatement,
-    s1: &MStatement,
+    s0: &AbcStatement,
+    s1: &AbcStatement,
     star_comms: (Comm, Comm, Comm, Comm),
     star_degs: (usize, usize, usize, usize),
     gamma: Fr,
@@ -272,9 +259,6 @@ fn build_pcc_statement(
         s0.c_n_u, s0.c_t_u, s0.c_n_v, s0.c_t_v,
         s1.c_n_u, s1.c_t_u, s1.c_n_v, s1.c_t_v,
     ];
-    // Convention bridge: `R_M` uses inclusive degree bounds (`deg ≤ d`, matching
-    // the paper's `lemma_degrees`), while `R_PCC` uses paper-strict exclusive
-    // bounds (`deg < d_i`, from compiler.tex). Translate by +1 at the boundary.
     let degrees = vec![
         d_n_u_star + 1, d_t_u_star + 1, d_n_v_star + 1, d_t_v_star + 1,
         s0.d_n_u + 1, s0.d_t_u + 1, s0.d_n_v + 1, s0.d_t_v + 1,
@@ -335,108 +319,126 @@ fn build_constraints(gamma: Fr) -> Vec<Constraint> {
 mod tests {
     use super::*;
     use crate::core::Relation;
-    use crate::relations::m::{leaf_instance, MRelation};
+    use crate::relations::abc::{leaf_instance, AbcRelation};
     use crate::relations::pcc::{PccParams, PccRelation};
     use ark_ff::UniformRand;
     use ark_poly::univariate::SparsePolynomial;
     use ark_std::test_rng;
 
-    /// Build params + two leaf statements/witnesses for the identity matrix M_n.
-    /// The SRS is sized for the *folded* polynomials (deg n+1, the largest
-    /// produced by the reduction), which also covers the leaves (deg n).
-    fn two_identity_leaves(n: usize) -> (MParams, (MStatement, MWitness), (MStatement, MWitness)) {
+    fn two_leaves(n: usize) -> (AbcParams, (AbcStatement, AbcWitness), (AbcStatement, AbcWitness)) {
         let rng = &mut test_rng();
-        let matrix: Vec<(usize, usize, Fr)> =
+        let a: Vec<(usize, usize, Fr)> =
             (0..n).map(|i| (i, i, Fr::from(1u64))).collect();
-        // After folding, N_u* has degree n+1 (each N has degree n, each T has degree 1).
+        let b: Vec<(usize, usize, Fr)> =
+            (0..n).map(|i| (i, (i + 1) % n, Fr::from(1u64))).collect();
+        let c: Vec<(usize, usize, Fr)> =
+            (0..n).map(|i| (i, i, Fr::rand(rng))).collect();
         let srs = pc::setup(n + 1, rng);
-        let params = MParams { srs, matrix, n };
+        let params = AbcParams { srs, matrix_a: a, matrix_b: b, matrix_c: c, n };
 
         let (s0, w0) = leaf_instance(&params, Fr::rand(rng), Fr::rand(rng));
         let (s1, w1) = leaf_instance(&params, Fr::rand(rng), Fr::rand(rng));
         (params, (s0, w0), (s1, w1))
     }
 
-    /// Reduce two valid leaves; the new R_M and R_PCC outputs must both verify.
     #[test]
     fn reduce_roundtrip() {
-        let (params, (s0, w0), (s1, w1)) = two_identity_leaves(4);
+        let (params, (s0, w0), (s1, w1)) = two_leaves(4);
         let mut transcript = Blake3Transcript::new(b"test");
 
-        let (_proof, (out_m_s, out_m_w), (out_pcc_s, out_pcc_w)) =
-            RokM::reduce(&params, &s0, &w0, &s1, &w1, &mut transcript);
+        let (_proof, (out_s, out_w), (out_pcc_s, out_pcc_w)) =
+            RokAbc::reduce(&params, &s0, &w0, &s1, &w1, &mut transcript);
 
         let pcc_params = PccParams { srs: params.srs.clone() };
-        assert!(MRelation::is_satisfied(&params, &out_m_s, &out_m_w));
+        assert!(AbcRelation::is_satisfied(&params, &out_s, &out_w));
         assert!(PccRelation::is_satisfied(&pcc_params, &out_pcc_s, &out_pcc_w));
     }
 
-    /// Prover and verifier, given fresh transcripts with the same label,
-    /// must reconstruct identical output statements.
     #[test]
     fn prover_verifier_agree() {
-        let (params, (s0, w0), (s1, w1)) = two_identity_leaves(4);
+        let (params, (s0, w0), (s1, w1)) = two_leaves(4);
         let mut t_p = Blake3Transcript::new(b"test");
         let mut t_v = Blake3Transcript::new(b"test");
 
-        let (proof, (m_p, _), (pcc_p, _)) =
-            RokM::reduce(&params, &s0, &w0, &s1, &w1, &mut t_p);
-        let (m_v, pcc_v) = RokM::verify(&s0, &s1, &proof, &mut t_v);
+        let (proof, (s_p, _), (pcc_p, _)) =
+            RokAbc::reduce(&params, &s0, &w0, &s1, &w1, &mut t_p);
+        let (s_v, pcc_v) = RokAbc::verify(&s0, &s1, &proof, &mut t_v);
 
-        assert_eq!(m_p, m_v);
+        assert_eq!(s_p, s_v);
         assert_eq!(pcc_p, pcc_v);
     }
 
-    /// Tampering `z` after `reduce` makes the verifier derive a different `γ`
-    /// (since `γ` depends on `z`), so the reconstructed `y*` differs from
-    /// what the prover's witness was built against — `is_satisfied` rejects.
     #[test]
-    fn tampered_z_breaks_m() {
-        let (params, (s0, w0), (s1, w1)) = two_identity_leaves(4);
+    fn tampered_z_a_breaks_abc() {
+        let (params, (s0, w0), (s1, w1)) = two_leaves(4);
         let mut t_p = Blake3Transcript::new(b"test");
         let mut t_v = Blake3Transcript::new(b"test");
 
-        let (mut proof, (_, m_wit), _) =
-            RokM::reduce(&params, &s0, &w0, &s1, &w1, &mut t_p);
-        proof.z += Fr::from(1u64);
+        let (mut proof, (_, wit), _) =
+            RokAbc::reduce(&params, &s0, &w0, &s1, &w1, &mut t_p);
+        proof.z_a += Fr::from(1u64);
 
-        let (m_v, _) = RokM::verify(&s0, &s1, &proof, &mut t_v);
-        assert!(!MRelation::is_satisfied(&params, &m_v, &m_wit));
+        let (s_v, _) = RokAbc::verify(&s0, &s1, &proof, &mut t_v);
+        assert!(!AbcRelation::is_satisfied(&params, &s_v, &wit));
     }
 
-    /// Tampering a commitment is absorbed *after* `γ` is squeezed, so it
-    /// doesn't change `γ` — but it breaks the PCC commit-validity check
-    /// because the recomputed commit no longer matches the tampered one.
+    #[test]
+    fn tampered_z_b_breaks_abc() {
+        let (params, (s0, w0), (s1, w1)) = two_leaves(4);
+        let mut t_p = Blake3Transcript::new(b"test");
+        let mut t_v = Blake3Transcript::new(b"test");
+
+        let (mut proof, (_, wit), _) =
+            RokAbc::reduce(&params, &s0, &w0, &s1, &w1, &mut t_p);
+        proof.z_b += Fr::from(1u64);
+
+        let (s_v, _) = RokAbc::verify(&s0, &s1, &proof, &mut t_v);
+        assert!(!AbcRelation::is_satisfied(&params, &s_v, &wit));
+    }
+
+    #[test]
+    fn tampered_z_c_breaks_abc() {
+        let (params, (s0, w0), (s1, w1)) = two_leaves(4);
+        let mut t_p = Blake3Transcript::new(b"test");
+        let mut t_v = Blake3Transcript::new(b"test");
+
+        let (mut proof, (_, wit), _) =
+            RokAbc::reduce(&params, &s0, &w0, &s1, &w1, &mut t_p);
+        proof.z_c += Fr::from(1u64);
+
+        let (s_v, _) = RokAbc::verify(&s0, &s1, &proof, &mut t_v);
+        assert!(!AbcRelation::is_satisfied(&params, &s_v, &wit));
+    }
+
     #[test]
     fn tampered_commitment_breaks_pcc() {
-        let (params, (s0, w0), (s1, w1)) = two_identity_leaves(4);
+        let (params, (s0, w0), (s1, w1)) = two_leaves(4);
         let mut t_p = Blake3Transcript::new(b"test");
         let mut t_v = Blake3Transcript::new(b"test");
 
         let (mut proof, _, (_, pcc_wit)) =
-            RokM::reduce(&params, &s0, &w0, &s1, &w1, &mut t_p);
+            RokAbc::reduce(&params, &s0, &w0, &s1, &w1, &mut t_p);
         let bogus =
             SparsePolynomial::from_coefficients_vec(vec![(0, Fr::from(123u64))]);
         proof.c_n_u_star = pc::commit(&params.srs, &Poly::Sparse(bogus));
 
-        let (_, pcc_v) = RokM::verify(&s0, &s1, &proof, &mut t_v);
+        let (_, pcc_v) = RokAbc::verify(&s0, &s1, &proof, &mut t_v);
         let pcc_params = PccParams { srs: params.srs.clone() };
         assert!(!PccRelation::is_satisfied(&pcc_params, &pcc_v, &pcc_wit));
     }
 
-    /// Different transcript labels yield different `γ`s — and therefore
-    /// different new commitments — even with identical inputs. `z` is
-    /// computed before any squeeze, so it stays the same.
     #[test]
     fn different_label_different_challenge() {
-        let (params, (s0, w0), (s1, w1)) = two_identity_leaves(4);
+        let (params, (s0, w0), (s1, w1)) = two_leaves(4);
         let mut t_a = Blake3Transcript::new(b"label_a");
         let mut t_b = Blake3Transcript::new(b"label_b");
 
-        let (proof_a, _, _) = RokM::reduce(&params, &s0, &w0, &s1, &w1, &mut t_a);
-        let (proof_b, _, _) = RokM::reduce(&params, &s0, &w0, &s1, &w1, &mut t_b);
+        let (proof_a, _, _) = RokAbc::reduce(&params, &s0, &w0, &s1, &w1, &mut t_a);
+        let (proof_b, _, _) = RokAbc::reduce(&params, &s0, &w0, &s1, &w1, &mut t_b);
 
-        assert_eq!(proof_a.z, proof_b.z);
+        assert_eq!(proof_a.z_a, proof_b.z_a);
+        assert_eq!(proof_a.z_b, proof_b.z_b);
+        assert_eq!(proof_a.z_c, proof_b.z_c);
         assert_ne!(proof_a.c_n_u_star, proof_b.c_n_u_star);
     }
 }
