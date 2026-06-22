@@ -40,6 +40,7 @@ pub struct AbcStatement {
     pub y_c: Fr,
 }
 
+#[derive(Clone)]
 pub struct AbcWitness {
     pub n_u: SparsePolynomial<Fr>,
     pub t_u: SparsePolynomial<Fr>,
