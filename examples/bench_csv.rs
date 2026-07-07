@@ -14,17 +14,25 @@
 //!   * Prover (Server): K independent lincheck proofs (one per delegated job).
 //!   * Verifier (per local party): 1 lincheck verification (their own).
 //!
-//! Side 2 — amortization:
-//!   * Prover (Server): AbcFold (K leaves → root) + RokP + 1 lincheck proof.
-//!   * Verifier (per local party): 1 path-verify into the folded root
-//!     + 1 RokP verify + 1 lincheck verify.
+//! Side 2 — amortization (full sound pipeline, per paper §5 `lfsc`):
+//!   * Prover (Server):
+//!       1. AbcFold: K leaves → root R_{A,B,C} + K·κ R_PCC fold promises.
+//!       2. Promise discharge: FsMt(Π_PC ∘ Π_DT) reduces every leaf's promise
+//!          bundle to one R_PCO claim at a shared point x; PcoFold folds the K
+//!          claims into one; a single KZG opening proves it.
+//!       3. Root discharge: RokP (root → R_P, with a self-contained R_PCO
+//!          opening in its proof) + 1 Marlin lincheck on the R_P claim.
+//!   * Verifier (per local party): 1 fold path-verify (recovering this leaf's
+//!     promises) + 1 FsMtPcc verify + 1 PcoFold path-verify + 1 final KZG
+//!     opening check + 1 RokP verify + 1 lincheck verify.
 //!
 //! The K-1 verifiers from Side 1 that "disappear" in Side 2 are not modeled —
 //! in the delegation setting they're absorbed into the Server's job. So the
 //! Verifier column is per-verifier (one of the K local parties), independent
 //! of K up to a `log K` term that comes from the path length.
 //!
-//! K=1 special case: skip AbcFold; run RokP directly on the leaf (no path).
+//! K=1 special case: no fold and hence no promises; run RokP directly on the
+//! leaf (no path, no promise discharge).
 
 use std::env;
 use std::fs::File;
@@ -41,11 +49,15 @@ use amortized_proofs_masters_thesis::marlin_ahp::inner_lincheck::{
 };
 use amortized_proofs_masters_thesis::pc;
 use amortized_proofs_masters_thesis::reductions::abc_fold::AbcFold;
+use amortized_proofs_masters_thesis::reductions::discharge::prove_discharge;
+use amortized_proofs_masters_thesis::reductions::fsmt_pcc::FsMtPcc;
+use amortized_proofs_masters_thesis::reductions::pco_fold::PcoFold;
 use amortized_proofs_masters_thesis::reductions::rok_p::RokP;
 use amortized_proofs_masters_thesis::relations::abc::{
     leaf_instance, AbcParams, AbcStatement, AbcWitness,
 };
 use amortized_proofs_masters_thesis::relations::p::PStatement;
+use amortized_proofs_masters_thesis::relations::pcc::{PccParams, PccStatement, PccWitness};
 use amortized_proofs_masters_thesis::transcript::Blake3Transcript;
 
 // ---------------------------------------------------------------------------
@@ -213,23 +225,67 @@ fn time_side_1(setup: &Setup, claims: &[PStatement]) -> (f64, f64) {
 }
 
 /// Returns (server_prove_ms, per_verifier_verify_ms) for Side 2.
-/// Server does AbcFold + RokP + 1 lincheck; each of the K local verifiers
-/// does 1 path-verify + 1 RokP verify + 1 lincheck verify — we measure one
-/// representative.
+///
+/// Server (K > 1): AbcFold → discharge the K·κ fold promises via FsMtPcc +
+/// PcoFold + one KZG opening → RokP + 1 lincheck on the root. Each of the K
+/// local verifiers checks its own fold path, its promise discharge (FsMtPcc +
+/// PcoFold + the shared opening), the RokP reduction, and the lincheck — we
+/// measure one representative (leaf 0). At K = 1 there is no fold and no
+/// promise to discharge, so only RokP + 1 lincheck run.
 fn time_side_2(setup: &Setup, leaves: Vec<(AbcStatement, AbcWitness)>) -> (f64, f64) {
+    let k = leaves.len();
     let leaf_stmts: Vec<AbcStatement> = leaves.iter().map(|(s, _)| s.clone()).collect();
+    let pcc_params = PccParams { srs: setup.srs.clone() };
 
+    // -------------------- Prover (Server) --------------------
     let t0 = Instant::now();
-    let (root_stmt, root_wit, paths) = if leaves.len() == 1 {
-        // K=1: no fold; the leaf itself is the "root".
+
+    // 1. Fold K leaves into the root R_{A,B,C}, collecting the per-leaf R_PCC
+    //    promises (κ per leaf).
+    let (root_stmt, root_wit, paths, pcc_bundles): (
+        AbcStatement,
+        AbcWitness,
+        Vec<_>,
+        Vec<Vec<(PccStatement, PccWitness)>>,
+    ) = if k == 1 {
         let (s, w) = leaves.into_iter().next().unwrap();
-        (s, w, Vec::new())
+        (s, w, Vec::new(), Vec::new())
     } else {
         let mut t = Blake3Transcript::new(b"bench::s2::fold");
-        let (root, paths, _bundles) =
-            AbcFold::prove(&setup.abc_params, leaves, &mut t);
-        (root.0, root.1, paths)
+        let (root, paths, bundles) = AbcFold::prove(&setup.abc_params, leaves, &mut t);
+        (root.0, root.1, paths, bundles)
     };
+
+    // 2. Discharge the promises: FsMt(Π_PC ∘ Π_DT) → K R_PCO claims at a shared
+    //    point x; PcoFold → 1 root R_PCO; one KZG opening proves it. A single
+    //    root witness is assembled directly (see `reductions::discharge`), so
+    //    the K per-leaf witnesses are never materialized. (No-op at K = 1,
+    //    where there are no promises.)
+    let discharge = if k == 1 {
+        None
+    } else {
+        let pcc_stmts: Vec<Vec<PccStatement>> = pcc_bundles
+            .iter()
+            .map(|b| b.iter().map(|(s, _)| s.clone()).collect())
+            .collect();
+        let pcc_wits: Vec<Vec<PccWitness>> = pcc_bundles
+            .into_iter()
+            .map(|b| b.into_iter().map(|(_, w)| w).collect())
+            .collect();
+
+        let mut t_fsmt = Blake3Transcript::new(b"bench::s2::fsmt");
+        let mut t_pcofold = Blake3Transcript::new(b"bench::s2::pcofold");
+        Some(prove_discharge(
+            &pcc_params,
+            &pcc_stmts,
+            &pcc_wits,
+            &mut t_fsmt,
+            &mut t_pcofold,
+        ))
+    };
+
+    // 3. Root discharge: RokP (root → R_P, with the R_PCO opening self-contained
+    //    in its proof) + one Marlin lincheck on the R_P claim.
     let mut t_rok = Blake3Transcript::new(b"bench::s2::rok");
     let (p_stmt, _pco_stmt, _pco_wit, rok_proof) =
         RokP::reduce(&setup.abc_params, &root_stmt, &root_wit, &mut t_rok);
@@ -238,16 +294,40 @@ fn time_side_2(setup: &Setup, leaves: Vec<(AbcStatement, AbcWitness)>) -> (f64, 
         InnerLincheck::prove(&setup.srs, &setup.index, &p_stmt, &mut t_lin);
     let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-    // Per-verifier: take the first local verifier as representative. They do
-    // their own AbcFold path-verify (if K > 1), plus the shared RokP and
-    // lincheck verifications (each verifier checks them independently).
+    // -------------------- Verifier (one local party, leaf 0) --------------------
     let t0 = Instant::now();
-    if !paths.is_empty() {
+
+    // 1. Fold path-verify → recover this leaf's κ promise statements.
+    let promises_0 = if paths.is_empty() {
+        Vec::new()
+    } else {
         let mut t = Blake3Transcript::new(b"bench::s2::fold");
-        let ok =
-            AbcFold::verify(&setup.abc_params, 0, &leaf_stmts[0], &paths[0], &root_stmt, &mut t);
-        assert!(ok.is_some());
+        AbcFold::verify(&setup.abc_params, 0, &leaf_stmts[0], &paths[0], &root_stmt, &mut t)
+            .expect("AbcFold verify")
+    };
+
+    // 2. Discharge-side verify: FsMtPcc reconstructs this leaf's R_PCO claim at
+    //    x, PcoFold checks it folds into the shared root, and the final KZG
+    //    opening is checked once.
+    if let Some(d) = &discharge {
+        let mut t_fsmtv = Blake3Transcript::new(b"bench::s2::fsmt");
+        let leaf_pco_0 =
+            FsMtPcc::verify(&pcc_params, 0, &promises_0, &d.fsmt_proofs[0], &mut t_fsmtv)
+                .expect("FsMtPcc verify");
+
+        let mut t_pcofoldv = Blake3Transcript::new(b"bench::s2::pcofold");
+        assert!(PcoFold::verify(0, &leaf_pco_0, &d.pco_paths[0], &d.root_stmt, &mut t_pcofoldv));
+
+        assert!(pc::verify(
+            &setup.srs,
+            &d.root_stmt.commitment,
+            d.root_stmt.point,
+            d.root_stmt.value,
+            &d.opening,
+        ));
     }
+
+    // 3. Root discharge: RokP verify + 1 lincheck verify.
     let mut t_rok_v = Blake3Transcript::new(b"bench::s2::rok");
     let _ = RokP::verify(&setup.abc_params, &root_stmt, &rok_proof, &mut t_rok_v)
         .expect("RokP verify");

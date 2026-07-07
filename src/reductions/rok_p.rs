@@ -1,11 +1,12 @@
 use ark_bls12_381::Fr;
 use ark_ff::{Field, One, Zero};
 use ark_poly::{
-    univariate::SparsePolynomial, EvaluationDomain, Polynomial, Radix2EvaluationDomain,
+    univariate::{DensePolynomial, SparsePolynomial},
+    DenseUVPolynomial, EvaluationDomain, Polynomial, Radix2EvaluationDomain,
 };
 
 use crate::pc::{self, Comm, Opening, Poly};
-use crate::reductions::poly_util::x_shift;
+use crate::reductions::poly_util::{x_shift, x_shift_dense};
 use crate::relations::abc::{AbcParams, AbcStatement, AbcWitness};
 use crate::relations::p::PStatement;
 use crate::relations::pco::{PcoStatement, PcoWitness};
@@ -92,15 +93,22 @@ impl RokP {
 
         absorb_abc_statement(transcript, stmt);
 
-        // --- Compute w_X = X·v vectors, then IFFT interpolants.
+        // --- Compute w_X = X·v vectors, then IFFT interpolants (DENSE — see comment below).
+        // NOTE on the dense/sparse split (the v0.5 speedup): polynomials that come
+        // out of IFFT are generically dense in coefficients, and their pairwise
+        // products (u·w, Λ·w, M·v below) cost O(n²) under SparsePolynomial::mul
+        // but only O(n log n) under DensePolynomial's FFT-based mul (arkworks
+        // auto-switches around deg 128). The witness's N/T polynomials are
+        // genuinely sparse (3 monomials at a leaf), so we leave those as
+        // SparsePolynomial and convert only at the batched-poly accumulator.
         let w_a_vec = matvec(&params.matrix_a, &wit.v, n);
         let w_b_vec = matvec(&params.matrix_b, &wit.v, n);
         let w_c_vec = matvec(&params.matrix_c, &wit.v, n);
-        let w_a_poly = ifft_sparse(&dom, &w_a_vec);
-        let w_b_poly = ifft_sparse(&dom, &w_b_vec);
-        let w_c_poly = ifft_sparse(&dom, &w_c_vec);
-        let u_poly = ifft_sparse(&dom, &wit.u);
-        let v_poly = ifft_sparse(&dom, &wit.v);
+        let w_a_poly = ifft_dense(&dom, &w_a_vec);
+        let w_b_poly = ifft_dense(&dom, &w_b_vec);
+        let w_c_poly = ifft_dense(&dom, &w_c_vec);
+        let u_poly = ifft_dense(&dom, &wit.u);
+        let v_poly = ifft_dense(&dom, &wit.v);
 
         // Strict degree bounds.
         let strict_d_n_u = stmt.d_n_u + 1;
@@ -111,20 +119,22 @@ impl RokP {
         let strict_d_q = n - 1;
 
         // --- Round 1 shifts and commitments.
+        // N/T shifts stay sparse (witness polynomials are sparse).
         let n_u_shift = x_shift(&wit.n_u, big_d - strict_d_n_u);
         let t_u_shift = x_shift(&wit.t_u, big_d - strict_d_t_u);
         let n_v_shift = x_shift(&wit.n_v, big_d - strict_d_n_v);
         let t_v_shift = x_shift(&wit.t_v, big_d - strict_d_t_v);
-        let w_a_shift = x_shift(&w_a_poly, big_d - strict_d_w);
-        let w_b_shift = x_shift(&w_b_poly, big_d - strict_d_w);
-        let w_c_shift = x_shift(&w_c_poly, big_d - strict_d_w);
+        // w shifts are dense (IFFT result is dense).
+        let w_a_shift = x_shift_dense(&w_a_poly, big_d - strict_d_w);
+        let w_b_shift = x_shift_dense(&w_b_poly, big_d - strict_d_w);
+        let w_c_shift = x_shift_dense(&w_c_poly, big_d - strict_d_w);
 
-        let c_w_a = pc::commit(srs, &Poly::Sparse(w_a_poly.clone()));
-        let c_w_b = pc::commit(srs, &Poly::Sparse(w_b_poly.clone()));
-        let c_w_c = pc::commit(srs, &Poly::Sparse(w_c_poly.clone()));
-        let c_w_a_shift = pc::commit(srs, &Poly::Sparse(w_a_shift.clone()));
-        let c_w_b_shift = pc::commit(srs, &Poly::Sparse(w_b_shift.clone()));
-        let c_w_c_shift = pc::commit(srs, &Poly::Sparse(w_c_shift.clone()));
+        let c_w_a = pc::commit(srs, &Poly::Dense(w_a_poly.clone()));
+        let c_w_b = pc::commit(srs, &Poly::Dense(w_b_poly.clone()));
+        let c_w_c = pc::commit(srs, &Poly::Dense(w_c_poly.clone()));
+        let c_w_a_shift = pc::commit(srs, &Poly::Dense(w_a_shift.clone()));
+        let c_w_b_shift = pc::commit(srs, &Poly::Dense(w_b_shift.clone()));
+        let c_w_c_shift = pc::commit(srs, &Poly::Dense(w_c_shift.clone()));
         let c_n_u_shift = pc::commit(srs, &Poly::Sparse(n_u_shift.clone()));
         let c_t_u_shift = pc::commit(srs, &Poly::Sparse(t_u_shift.clone()));
         let c_n_v_shift = pc::commit(srs, &Poly::Sparse(n_v_shift.clone()));
@@ -146,36 +156,37 @@ impl RokP {
 
         // --- Build G(X) and decompose for the sumcheck.
         let lambda_alpha_vec = dom.evaluate_all_lagrange_coefficients(alpha);
-        let lambda_alpha_poly = ifft_sparse(&dom, &lambda_alpha_vec);
+        let lambda_alpha_poly = ifft_dense(&dom, &lambda_alpha_vec);
 
         // Per-matrix column-evaluated polynomials M_X(α, ·).
-        let m_a_alpha_poly = ifft_sparse(
+        let m_a_alpha_poly = ifft_dense(
             &dom,
             &m_evaluated_at_alpha(&params.matrix_a, &lambda_alpha_vec, n),
         );
-        let m_b_alpha_poly = ifft_sparse(
+        let m_b_alpha_poly = ifft_dense(
             &dom,
             &m_evaluated_at_alpha(&params.matrix_b, &lambda_alpha_vec, n),
         );
-        let m_c_alpha_poly = ifft_sparse(
+        let m_c_alpha_poly = ifft_dense(
             &dom,
             &m_evaluated_at_alpha(&params.matrix_c, &lambda_alpha_vec, n),
         );
 
-        // g_X(X) = u(X)·w_X(X)                       — sum = y_X
-        // g'_X(X) = Λ(α,X)·w_X(X) − M_X(α,X)·v(X)    — sum = 0
-        let g_a = u_poly.mul(&w_a_poly);
-        let g_b = u_poly.mul(&w_b_poly);
-        let g_c = u_poly.mul(&w_c_poly);
-        let lam_a = lambda_alpha_poly.mul(&w_a_poly);
-        let lam_b = lambda_alpha_poly.mul(&w_b_poly);
-        let lam_c = lambda_alpha_poly.mul(&w_c_poly);
-        let mv_a = m_a_alpha_poly.mul(&v_poly);
-        let mv_b = m_b_alpha_poly.mul(&v_poly);
-        let mv_c = m_c_alpha_poly.mul(&v_poly);
-        let g_p_a = &lam_a + &(&mv_a * -Fr::one());
-        let g_p_b = &lam_b + &(&mv_b * -Fr::one());
-        let g_p_c = &lam_c + &(&mv_c * -Fr::one());
+        // g_X(X)  = u(X)·w_X(X)                       — sum = y_X
+        // g'_X(X) = Λ(α,X)·w_X(X) − M_X(α,X)·v(X)     — sum = 0
+        // Dense × Dense uses arkworks' FFT-based mul above degree ~128.
+        let g_a = &u_poly * &w_a_poly;
+        let g_b = &u_poly * &w_b_poly;
+        let g_c = &u_poly * &w_c_poly;
+        let lam_a = &lambda_alpha_poly * &w_a_poly;
+        let lam_b = &lambda_alpha_poly * &w_b_poly;
+        let lam_c = &lambda_alpha_poly * &w_c_poly;
+        let mv_a = &m_a_alpha_poly * &v_poly;
+        let mv_b = &m_b_alpha_poly * &v_poly;
+        let mv_c = &m_c_alpha_poly * &v_poly;
+        let g_p_a = &lam_a - &mv_a;
+        let g_p_b = &lam_b - &mv_b;
+        let g_p_c = &lam_c - &mv_c;
 
         // G(X) = g_A + η·g_B + η²·g_C + η³·g'_A + η⁴·g'_B + η⁵·g'_C
         let eta2 = eta * eta;
@@ -184,11 +195,11 @@ impl RokP {
         let eta5 = eta4 * eta;
         let big_g = {
             let mut acc = g_a;
-            acc = &acc + &(&g_b * eta);
-            acc = &acc + &(&g_c * eta2);
-            acc = &acc + &(&g_p_a * eta3);
-            acc = &acc + &(&g_p_b * eta4);
-            acc = &acc + &(&g_p_c * eta5);
+            acc = &acc + &scale_dense(&g_b, eta);
+            acc = &acc + &scale_dense(&g_c, eta2);
+            acc = &acc + &scale_dense(&g_p_a, eta3);
+            acc = &acc + &scale_dense(&g_p_b, eta4);
+            acc = &acc + &scale_dense(&g_p_c, eta5);
             acc
         };
 
@@ -196,13 +207,13 @@ impl RokP {
         let y_comb_sum = stmt.y_a + eta * stmt.y_b + eta2 * stmt.y_c;
         let (q0_poly, q1_poly) = sumcheck_decompose(&big_g, y_comb_sum / n_fr, n);
 
-        let q0_shift = x_shift(&q0_poly, big_d - strict_d_q);
-        let q1_shift = x_shift(&q1_poly, big_d - strict_d_q);
+        let q0_shift = x_shift_dense(&q0_poly, big_d - strict_d_q);
+        let q1_shift = x_shift_dense(&q1_poly, big_d - strict_d_q);
 
-        let c_q0 = pc::commit(srs, &Poly::Sparse(q0_poly.clone()));
-        let c_q1 = pc::commit(srs, &Poly::Sparse(q1_poly.clone()));
-        let c_q0_shift = pc::commit(srs, &Poly::Sparse(q0_shift.clone()));
-        let c_q1_shift = pc::commit(srs, &Poly::Sparse(q1_shift.clone()));
+        let c_q0 = pc::commit(srs, &Poly::Dense(q0_poly.clone()));
+        let c_q1 = pc::commit(srs, &Poly::Dense(q1_poly.clone()));
+        let c_q0_shift = pc::commit(srs, &Poly::Dense(q0_shift.clone()));
+        let c_q1_shift = pc::commit(srs, &Poly::Dense(q1_shift.clone()));
 
         transcript.absorb(b"rok_p::c_q0", &c_q0);
         transcript.absorb(b"rok_p::c_q1", &c_q1);
@@ -231,15 +242,9 @@ impl RokP {
         // Combined claim shipped to R_P (and used by the verifier in G(β)).
         let y_combined = mu_a + eta * mu_b + eta2 * mu_c;
 
-        // --- Batched polynomial and the corresponding commitment / value.
-        let polys = [
-            &wit.n_u, &wit.t_u, &wit.n_v, &wit.t_v,
-            &w_a_poly, &w_b_poly, &w_c_poly,
-            &q0_poly, &q1_poly,
-            &n_u_shift, &t_u_shift, &n_v_shift, &t_v_shift,
-            &w_a_shift, &w_b_shift, &w_c_shift,
-            &q0_shift, &q1_shift,
-        ];
+        // --- Batched polynomial, commitment, and value.
+        // Mixed sparse (N/T) + dense (w, q) sources — accumulate into a single
+        // dense `Vec<Fr>` of length `big_d`, then wrap once at the end.
         let commits = [
             stmt.c_n_u, stmt.c_t_u, stmt.c_n_v, stmt.c_t_v,
             c_w_a, c_w_b, c_w_c,
@@ -255,24 +260,50 @@ impl RokP {
             strict_d_w, strict_d_q,
         );
 
-        let mut p_batch = SparsePolynomial::<Fr>::zero();
+        // Pass 1: scalar accumulators (cheap — just 18 commit/eval multiplies).
         let mut c_batch = Comm::zero();
         let mut v_batch = Fr::zero();
         let mut pow = Fr::one();
-        for ((poly, c), v) in polys.iter().zip(&commits).zip(&evals) {
-            p_batch = &p_batch + &(*poly * pow);
+        for (c, v) in commits.iter().zip(&evals) {
             c_batch += *c * pow;
             v_batch += *v * pow;
             pow *= eta_p;
         }
 
+        // Pass 2: polynomial coefficient accumulation into a dense buffer.
+        let mut p_batch_coeffs: Vec<Fr> = vec![Fr::zero(); big_d];
+        let mut pow = Fr::one();
+        // Order MUST match `commits`/`evals` above.
+        add_sparse_into(&mut p_batch_coeffs, &wit.n_u, pow);    pow *= eta_p;
+        add_sparse_into(&mut p_batch_coeffs, &wit.t_u, pow);    pow *= eta_p;
+        add_sparse_into(&mut p_batch_coeffs, &wit.n_v, pow);    pow *= eta_p;
+        add_sparse_into(&mut p_batch_coeffs, &wit.t_v, pow);    pow *= eta_p;
+        add_dense_into(&mut p_batch_coeffs, &w_a_poly, pow);    pow *= eta_p;
+        add_dense_into(&mut p_batch_coeffs, &w_b_poly, pow);    pow *= eta_p;
+        add_dense_into(&mut p_batch_coeffs, &w_c_poly, pow);    pow *= eta_p;
+        add_dense_into(&mut p_batch_coeffs, &q0_poly, pow);     pow *= eta_p;
+        add_dense_into(&mut p_batch_coeffs, &q1_poly, pow);     pow *= eta_p;
+        add_sparse_into(&mut p_batch_coeffs, &n_u_shift, pow);  pow *= eta_p;
+        add_sparse_into(&mut p_batch_coeffs, &t_u_shift, pow);  pow *= eta_p;
+        add_sparse_into(&mut p_batch_coeffs, &n_v_shift, pow);  pow *= eta_p;
+        add_sparse_into(&mut p_batch_coeffs, &t_v_shift, pow);  pow *= eta_p;
+        add_dense_into(&mut p_batch_coeffs, &w_a_shift, pow);   pow *= eta_p;
+        add_dense_into(&mut p_batch_coeffs, &w_b_shift, pow);   pow *= eta_p;
+        add_dense_into(&mut p_batch_coeffs, &w_c_shift, pow);   pow *= eta_p;
+        add_dense_into(&mut p_batch_coeffs, &q0_shift, pow);    pow *= eta_p;
+        add_dense_into(&mut p_batch_coeffs, &q1_shift, pow);
+
+        let p_batch_dense = DensePolynomial::from_coefficients_vec(p_batch_coeffs);
         let (batched_opening, opened_value) =
-            pc::prove(srs, &Poly::Sparse(p_batch.clone()), beta);
+            pc::prove(srs, &Poly::Dense(p_batch_dense.clone()), beta);
         debug_assert_eq!(opened_value, v_batch, "batched opening must match v_batch");
+
+        // PcoWitness stores SparsePolynomial; convert once at the boundary.
+        let p_batch_sparse = dense_to_sparse(&p_batch_dense);
 
         let p_stmt = PStatement { alpha, beta, y: y_combined, eta };
         let pco_stmt = PcoStatement { commitment: c_batch, point: beta, value: v_batch };
-        let pco_wit = PcoWitness { polynomial: p_batch };
+        let pco_wit = PcoWitness { polynomial: p_batch_sparse };
         let proof = RokPProof {
             c_w_a, c_w_b, c_w_c,
             c_w_a_shift, c_w_b_shift, c_w_c_shift,
@@ -437,14 +468,18 @@ fn mu_at(
         .sum()
 }
 
-fn ifft_sparse(dom: &Radix2EvaluationDomain<Fr>, evals: &[Fr]) -> SparsePolynomial<Fr> {
-    let coeffs = dom.ifft(evals);
-    vec_to_sparse(&coeffs)
+fn ifft_dense(dom: &Radix2EvaluationDomain<Fr>, evals: &[Fr]) -> DensePolynomial<Fr> {
+    DensePolynomial::from_coefficients_vec(dom.ifft(evals))
 }
 
-fn vec_to_sparse(v: &[Fr]) -> SparsePolynomial<Fr> {
+fn scale_dense(p: &DensePolynomial<Fr>, c: Fr) -> DensePolynomial<Fr> {
+    DensePolynomial::from_coefficients_vec(p.coeffs.iter().map(|&x| x * c).collect())
+}
+
+fn dense_to_sparse(p: &DensePolynomial<Fr>) -> SparsePolynomial<Fr> {
     SparsePolynomial::from_coefficients_vec(
-        v.iter()
+        p.coeffs
+            .iter()
             .enumerate()
             .filter(|(_, c)| !c.is_zero())
             .map(|(i, &c)| (i, c))
@@ -452,24 +487,17 @@ fn vec_to_sparse(v: &[Fr]) -> SparsePolynomial<Fr> {
     )
 }
 
-fn sparse_to_dense_vec(p: &SparsePolynomial<Fr>, len: usize) -> Vec<Fr> {
-    let mut v = vec![Fr::zero(); len];
-    for &(i, c) in p.iter() {
-        if i < len {
-            v[i] = c;
-        }
-    }
-    v
-}
-
 /// Decompose `G(X) = y_combined/n + X·q_0(X) + (X^n − 1)·q_1(X)`,
 /// returning `(q_0, q_1)`. Both have degree ≤ n − 2.
 fn sumcheck_decompose(
-    big_g: &SparsePolynomial<Fr>,
+    big_g: &DensePolynomial<Fr>,
     y_over_n: Fr,
     n: usize,
-) -> (SparsePolynomial<Fr>, SparsePolynomial<Fr>) {
-    let c = sparse_to_dense_vec(big_g, 2 * n - 1);
+) -> (DensePolynomial<Fr>, DensePolynomial<Fr>) {
+    let mut c = big_g.coeffs.clone();
+    if c.len() < 2 * n - 1 {
+        c.resize(2 * n - 1, Fr::zero());
+    }
 
     let mut r = vec![Fr::zero(); n];
     for k in 0..(n - 1) {
@@ -481,11 +509,27 @@ fn sumcheck_decompose(
     let q1: Vec<Fr> = (0..(n - 1)).map(|j| c[j + n]).collect();
     let q0: Vec<Fr> = (0..(n - 1)).map(|j| r[j + 1]).collect();
 
-    (vec_to_sparse(&q0), vec_to_sparse(&q1))
+    (
+        DensePolynomial::from_coefficients_vec(q0),
+        DensePolynomial::from_coefficients_vec(q1),
+    )
 }
 
 fn pow_usize(x: Fr, k: usize) -> Fr {
     x.pow([k as u64])
+}
+
+/// Accumulate `scale · p(X)` into the coefficient buffer `acc`.
+fn add_sparse_into(acc: &mut [Fr], p: &SparsePolynomial<Fr>, scale: Fr) {
+    for &(i, c) in p.iter() {
+        acc[i] += scale * c;
+    }
+}
+
+fn add_dense_into(acc: &mut [Fr], p: &DensePolynomial<Fr>, scale: Fr) {
+    for (i, &c) in p.coeffs.iter().enumerate() {
+        acc[i] += scale * c;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -23,11 +23,13 @@ use amortized_proofs_masters_thesis::marlin_ahp::inner_lincheck::{
 };
 use amortized_proofs_masters_thesis::pc;
 use amortized_proofs_masters_thesis::reductions::abc_fold::AbcFold;
+use amortized_proofs_masters_thesis::reductions::discharge::prove_discharge;
 use amortized_proofs_masters_thesis::reductions::rok_p::RokP;
 use amortized_proofs_masters_thesis::relations::abc::{
     leaf_instance, AbcParams, AbcStatement, AbcWitness,
 };
 use amortized_proofs_masters_thesis::relations::p::PStatement;
+use amortized_proofs_masters_thesis::relations::pcc::{PccParams, PccStatement, PccWitness};
 use amortized_proofs_masters_thesis::transcript::Blake3Transcript;
 
 /// Subgroup size — shared by all benchmarks here. Big enough that timings
@@ -121,9 +123,12 @@ fn bench_side_1(c: &mut Criterion) {
     group.finish();
 }
 
-/// Side 2: AbcFold + RokP on K leaves, then 1 inner-lincheck on R_P.
+/// Side 2 (full sound pipeline): AbcFold on K leaves → discharge the K·κ fold
+/// promises via FsMtPcc + PcoFold + one KZG opening → RokP + 1 inner-lincheck
+/// on the root R_P.
 fn bench_side_2(c: &mut Criterion) {
     let setup = build_setup(N);
+    let pcc_params = PccParams { srs: setup.srs.clone() };
     let mut group = c.benchmark_group("side_2_amortize_plus_lincheck");
     for &k in K_VALUES_AMORTIZED {
         let leaves = random_leaves(&setup, k);
@@ -131,9 +136,32 @@ fn bench_side_2(c: &mut Criterion) {
             b.iter_batched(
                 || leaves.clone(),
                 |leaves| {
+                    // 1. Fold: K leaves → root + K·κ R_PCC promises.
                     let mut t_fold = Blake3Transcript::new(b"bench::side2::fold");
-                    let (root, _, _) =
+                    let (root, _paths, bundles) =
                         AbcFold::prove(&setup.abc_params, leaves, &mut t_fold);
+
+                    // 2. Discharge promises with a single materialized root
+                    //    witness + one KZG opening.
+                    let pcc_stmts: Vec<Vec<PccStatement>> = bundles
+                        .iter()
+                        .map(|bd| bd.iter().map(|(s, _)| s.clone()).collect())
+                        .collect();
+                    let pcc_wits: Vec<Vec<PccWitness>> = bundles
+                        .into_iter()
+                        .map(|bd| bd.into_iter().map(|(_, w)| w).collect())
+                        .collect();
+                    let mut t_fsmt = Blake3Transcript::new(b"bench::side2::fsmt");
+                    let mut t_pcofold = Blake3Transcript::new(b"bench::side2::pcofold");
+                    let discharge = prove_discharge(
+                        &pcc_params,
+                        &pcc_stmts,
+                        &pcc_wits,
+                        &mut t_fsmt,
+                        &mut t_pcofold,
+                    );
+
+                    // 3. Root discharge: RokP + 1 lincheck.
                     let mut t_rok = Blake3Transcript::new(b"bench::side2::rok");
                     let (p_stmt, _, _, _) =
                         RokP::reduce(&setup.abc_params, &root.0, &root.1, &mut t_rok);
@@ -144,7 +172,7 @@ fn bench_side_2(c: &mut Criterion) {
                         &p_stmt,
                         &mut t_lin,
                     );
-                    black_box(proof);
+                    let _ = black_box((proof, discharge.opening));
                 },
                 BatchSize::LargeInput,
             );

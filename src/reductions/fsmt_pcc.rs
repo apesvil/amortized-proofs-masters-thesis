@@ -36,14 +36,33 @@ pub struct FsMtPccProof {
     pub root: [u8; 32],
 }
 
+/// Deferred witness for one leaf: the flat sparse polynomial basis (in RLC
+/// order) plus the leaf's RLC challenge. The leaf's PCO witness is
+/// `Σ_k r^k · polys[k]`; keeping it unmaterialized lets the amortized
+/// discharge assemble only the single folded root witness
+/// (see `reductions::discharge`).
+pub struct LeafWitnessRecipe {
+    pub polys: Vec<SparsePolynomial<Fr>>,
+    pub r: Fr,
+}
+
 impl FsMtPcc {
-    /// Amortized prover. Returns one tuple per leaf.
-    pub fn reduce_amortized(
+    /// Amortized prover, statement/proof phase only. Returns, per leaf, its
+    /// `FsMtPccProof`, its output `PcoStatement`, and a *witness recipe* — the
+    /// flat sparse polynomial basis (in RLC `k`-order) plus the leaf's RLC
+    /// challenge `r`, so the leaf witness is `Σ_k r^k · polys[k]`.
+    ///
+    /// This performs all the transcript-bearing work (challenges, commitments,
+    /// evaluations) via the homomorphic (commitment) path but never
+    /// materializes a leaf witness polynomial. Deferring witness assembly lets
+    /// `reductions::discharge` build only the single folded root witness,
+    /// avoiding the per-leaf densification.
+    pub fn reduce_amortized_stmts(
         params: &PccParams,
         stmts: &[Vec<PccStatement>],
         wits: &[Vec<PccWitness>],
         transcript: &mut Blake3Transcript,
-    ) -> Vec<(FsMtPccProof, PcoStatement, PcoWitness)> {
+    ) -> (Vec<FsMtPccProof>, Vec<PcoStatement>, Vec<LeafWitnessRecipe>) {
         assert_eq!(stmts.len(), wits.len(), "K leaves on both sides");
         let k = stmts.len();
         assert!(
@@ -94,63 +113,95 @@ impl FsMtPcc {
         let x: Fr = transcript.squeeze_field(b"fsmt_pcc::x");
 
         // 4. Per leaf: evaluate every polynomial at `x`, squeeze leaf-local `r`,
-        //    then RLC across the entire bundle (flat over inner stmts).
-        (0..k)
-            .map(|i| {
-                let d_bundle_stmts = &d_stmts[i];
-                let d_bundle_wits = &d_wits[i];
+        //    then build the *homomorphic* RLC of commitments and values (no
+        //    polynomial arithmetic — the sparse basis is recorded instead).
+        let mut proofs: Vec<FsMtPccProof> = Vec::with_capacity(k);
+        let mut pco_stmts: Vec<PcoStatement> = Vec::with_capacity(k);
+        let mut recipes: Vec<LeafWitnessRecipe> = Vec::with_capacity(k);
 
-                // Per-inner-stmt evaluations.
-                let values: Vec<Vec<Fr>> = d_bundle_wits
+        for i in 0..k {
+            let d_bundle_stmts = &d_stmts[i];
+            let d_bundle_wits = &d_wits[i];
+
+            // Per-inner-stmt evaluations at `x`.
+            let values: Vec<Vec<Fr>> = d_bundle_wits
+                .iter()
+                .map(|w| w.polynomials.iter().map(|p| p.evaluate(&x)).collect())
+                .collect();
+
+            let mut t_pc = transcript.fork(b"fsmt_pcc::pc");
+            t_pc.absorb_usize(b"leaf_idx", i);
+            for vs in &values {
+                for v in vs {
+                    t_pc.absorb(b"y", v);
+                }
+            }
+            let r: Fr = t_pc.squeeze_field(b"r");
+
+            // Homomorphic RLC of commitments and values; record the sparse
+            // polynomial basis (same flat `k`-order) for deferred assembly.
+            let mut r_pow = Fr::from(1u64);
+            let mut combined_comm = Comm::zero();
+            let mut combined_value = Fr::from(0u64);
+            let mut polys: Vec<SparsePolynomial<Fr>> = Vec::new();
+            for ((d_stmt, d_wit), vs) in
+                d_bundle_stmts.iter().zip(d_bundle_wits).zip(&values)
+            {
+                for ((p, c), &y) in d_wit
+                    .polynomials
                     .iter()
-                    .map(|w| w.polynomials.iter().map(|p| p.evaluate(&x)).collect())
-                    .collect();
-
-                let mut t_pc = transcript.fork(b"fsmt_pcc::pc");
-                t_pc.absorb_usize(b"leaf_idx", i);
-                for vs in &values {
-                    for v in vs {
-                        t_pc.absorb(b"y", v);
-                    }
-                }
-                let r: Fr = t_pc.squeeze_field(b"r");
-
-                // RLC across all (inner_stmt × poly) pairs.
-                let mut r_pow = Fr::from(1u64);
-                let mut combined_poly = SparsePolynomial::<Fr>::zero();
-                let mut combined_comm = Comm::zero();
-                let mut combined_value = Fr::from(0u64);
-                for ((d_stmt, d_wit), vs) in
-                    d_bundle_stmts.iter().zip(d_bundle_wits).zip(&values)
+                    .zip(&d_stmt.commitments)
+                    .zip(vs)
                 {
-                    for ((p, c), &y) in d_wit
-                        .polynomials
-                        .iter()
-                        .zip(&d_stmt.commitments)
-                        .zip(vs)
-                    {
-                        let scaled = p * r_pow;
-                        combined_poly = &combined_poly + &scaled;
-                        combined_comm += *c * r_pow;
-                        combined_value += y * r_pow;
-                        r_pow *= r;
-                    }
+                    combined_comm += *c * r_pow;
+                    combined_value += y * r_pow;
+                    polys.push(p.clone());
+                    r_pow *= r;
                 }
+            }
 
-                let pco_stmt = PcoStatement {
-                    commitment: combined_comm,
-                    point: x,
-                    value: combined_value,
-                };
-                let pco_wit = PcoWitness { polynomial: combined_poly };
+            pco_stmts.push(PcoStatement {
+                commitment: combined_comm,
+                point: x,
+                value: combined_value,
+            });
+            proofs.push(FsMtPccProof {
+                shifted_commitments: dt_proofs[i].clone(),
+                values,
+                membership: tree.membership_proof(i),
+                root,
+            });
+            recipes.push(LeafWitnessRecipe { polys, r });
+        }
 
-                let proof = FsMtPccProof {
-                    shifted_commitments: dt_proofs[i].clone(),
-                    values,
-                    membership: tree.membership_proof(i),
-                    root,
-                };
-                (proof, pco_stmt, pco_wit)
+        (proofs, pco_stmts, recipes)
+    }
+
+    /// Amortized prover. Returns one tuple per leaf, materializing each leaf's
+    /// PCO witness `Σ_k r^k · polys[k]`. Prefer `reductions::discharge` when
+    /// only the single folded root witness is needed — this wrapper builds all
+    /// K leaf witnesses and is kept for the standalone per-leaf API and tests.
+    pub fn reduce_amortized(
+        params: &PccParams,
+        stmts: &[Vec<PccStatement>],
+        wits: &[Vec<PccWitness>],
+        transcript: &mut Blake3Transcript,
+    ) -> Vec<(FsMtPccProof, PcoStatement, PcoWitness)> {
+        let (proofs, pco_stmts, recipes) =
+            Self::reduce_amortized_stmts(params, stmts, wits, transcript);
+        proofs
+            .into_iter()
+            .zip(pco_stmts)
+            .zip(recipes)
+            .map(|((proof, stmt), recipe)| {
+                let mut combined = SparsePolynomial::<Fr>::zero();
+                let mut r_pow = Fr::from(1u64);
+                for p in &recipe.polys {
+                    let scaled = p * r_pow;
+                    combined = &combined + &scaled;
+                    r_pow *= recipe.r;
+                }
+                (proof, stmt, PcoWitness { polynomial: combined })
             })
             .collect()
     }

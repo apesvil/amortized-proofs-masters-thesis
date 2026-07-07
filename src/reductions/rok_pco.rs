@@ -78,6 +78,31 @@ impl RokPco {
             value: y_prime,
         }
     }
+
+    /// Fold a specific left/right statement pair, returning the folded
+    /// statement together with the challenge used. The transcript operations
+    /// match `reduce`/`verify` on the 2-element slice `[left, right]`, so a
+    /// tree-folder can recover each leaf's root coefficient without ever
+    /// materializing intermediate witness polynomials.
+    pub fn fold_pair_stmt(
+        left: &PcoStatement,
+        right: &PcoStatement,
+        transcript: &mut Blake3Transcript,
+    ) -> (PcoStatement, Fr) {
+        debug_assert_eq!(
+            left.point, right.point,
+            "RokPco::fold_pair_stmt inputs must share the same point"
+        );
+        let stmts = [left.clone(), right.clone()];
+        absorb_inputs(transcript, &stmts);
+        let r: Fr = transcript.squeeze_field(b"rok_pco::r");
+        let out = PcoStatement {
+            commitment: left.commitment + right.commitment * r,
+            point: left.point,
+            value: left.value + right.value * r,
+        };
+        (out, r)
+    }
 }
 
 // ---------------------------------------------------------------------------

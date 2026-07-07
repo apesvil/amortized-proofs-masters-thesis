@@ -1,3 +1,7 @@
+use ark_bls12_381::Fr;
+use ark_ff::Zero;
+use ark_poly::univariate::SparsePolynomial;
+
 use crate::merkle::{verify_membership_from_hash, MembershipProof, MerkleTree};
 use crate::relations::pco::{PcoStatement, PcoWitness};
 use crate::transcript::Blake3Transcript;
@@ -32,92 +36,125 @@ pub struct PcoFoldPathProof {
 }
 
 impl PcoFold {
-    /// Prover side. All input statements must share the same evaluation
-    /// point `x` (precondition); panics otherwise.
-    pub fn fold_amortized(
-        leaves: Vec<(PcoStatement, PcoWitness)>,
+    /// Statement/challenge phase of the fold. Builds the Merkle tree and the
+    /// binary fold tree over `leaf_stmts` alone, returning the root statement,
+    /// the per-leaf path proofs, and each leaf's scalar coefficient in the root
+    /// (the product of the node challenges on the steps where the leaf is a
+    /// right child). No witness polynomials are touched — a caller assembles
+    /// the single root witness as `Σ_i coeff_i · leaf_wit_i` in one pass.
+    pub fn fold_stmts(
+        leaf_stmts: &[PcoStatement],
         transcript: &mut Blake3Transcript,
-    ) -> ((PcoStatement, PcoWitness), Vec<PcoFoldPathProof>) {
-        let k = leaves.len();
+    ) -> (PcoStatement, Vec<PcoFoldPathProof>, Vec<Fr>) {
+        let k = leaf_stmts.len();
         assert!(
             k.is_power_of_two() && k >= 2,
             "K must be a power of two ≥ 2"
         );
         let kappa = k.trailing_zeros() as usize;
-        assert_shared_point(&leaves);
+        assert_shared_point_stmts(leaf_stmts);
 
         // 1. Hash each input PCO statement, build the Merkle tree, absorb root.
-        let leaf_hashes: Vec<[u8; 32]> = leaves
+        let leaf_hashes: Vec<[u8; 32]> = leaf_stmts
             .iter()
             .enumerate()
-            .map(|(i, (s, _))| hash_leaf(transcript, i, s))
+            .map(|(i, s)| hash_leaf(transcript, i, s))
             .collect();
         let tree = MerkleTree::from_leaf_hashes(&leaf_hashes);
         let root = tree.root();
         transcript.absorb_bytes(b"pco_fold::root", &root);
 
-        // 2. Build the fold tree, recording per-leaf siblings.
+        // 2. Build the fold tree over statements, recording per-node siblings
+        //    and challenges.
         let mut node_left_stmts: Vec<Vec<PcoStatement>> = Vec::with_capacity(kappa);
         let mut node_right_stmts: Vec<Vec<PcoStatement>> = Vec::with_capacity(kappa);
-        let mut current: Vec<(PcoStatement, PcoWitness)> = leaves;
+        let mut node_challenges: Vec<Vec<Fr>> = Vec::with_capacity(kappa);
+        let mut current: Vec<PcoStatement> = leaf_stmts.to_vec();
 
         for level in 0..kappa {
             let pairs = current.len() / 2;
-            let mut next: Vec<(PcoStatement, PcoWitness)> = Vec::with_capacity(pairs);
+            let mut next: Vec<PcoStatement> = Vec::with_capacity(pairs);
             let mut lefts: Vec<PcoStatement> = Vec::with_capacity(pairs);
             let mut rights: Vec<PcoStatement> = Vec::with_capacity(pairs);
+            let mut challenges: Vec<Fr> = Vec::with_capacity(pairs);
 
             let mut iter = current.into_iter();
             for pair_idx in 0..pairs {
-                let (left_stmt, left_wit) = iter.next().unwrap();
-                let (right_stmt, right_wit) = iter.next().unwrap();
+                let left_stmt = iter.next().unwrap();
+                let right_stmt = iter.next().unwrap();
 
                 let mut t_node = transcript.fork(b"pco_fold");
                 t_node.absorb_usize(b"level", level);
                 t_node.absorb_usize(b"pair", pair_idx);
 
-                // Binary RokPco fold over the pair.
-                let stmts_pair = vec![left_stmt.clone(), right_stmt.clone()];
-                let wits_pair = vec![left_wit, right_wit];
-                let (folded_stmt, folded_wit) =
-                    RokPco::reduce(&stmts_pair, &wits_pair, &mut t_node);
+                let (folded_stmt, r) =
+                    RokPco::fold_pair_stmt(&left_stmt, &right_stmt, &mut t_node);
 
                 lefts.push(left_stmt);
                 rights.push(right_stmt);
-                next.push((folded_stmt, folded_wit));
+                challenges.push(r);
+                next.push(folded_stmt);
             }
             node_left_stmts.push(lefts);
             node_right_stmts.push(rights);
+            node_challenges.push(challenges);
             current = next;
         }
         assert_eq!(current.len(), 1);
-        let root_pair = current.into_iter().next().unwrap();
+        let root_stmt = current.into_iter().next().unwrap();
 
-        // 3. Build per-leaf paths.
-        let paths: Vec<PcoFoldPathProof> = (0..k)
-            .map(|leaf_idx| {
-                let mut steps: Vec<PcoFoldPathStep> = Vec::with_capacity(kappa);
-                let mut cur = leaf_idx;
-                for level in 0..kappa {
-                    let pair_idx = cur / 2;
-                    let position = cur & 1;
-                    let sibling = if position == 0 {
-                        node_right_stmts[level][pair_idx].clone()
-                    } else {
-                        node_left_stmts[level][pair_idx].clone()
-                    };
-                    steps.push(PcoFoldPathStep { sibling });
-                    cur = pair_idx;
+        // 3. Build per-leaf paths and root coefficients.
+        let mut paths: Vec<PcoFoldPathProof> = Vec::with_capacity(k);
+        let mut coeffs: Vec<Fr> = Vec::with_capacity(k);
+        for leaf_idx in 0..k {
+            let mut steps: Vec<PcoFoldPathStep> = Vec::with_capacity(kappa);
+            let mut coeff = Fr::from(1u64);
+            let mut cur = leaf_idx;
+            for level in 0..kappa {
+                let pair_idx = cur / 2;
+                let position = cur & 1;
+                let sibling = if position == 0 {
+                    node_right_stmts[level][pair_idx].clone()
+                } else {
+                    node_left_stmts[level][pair_idx].clone()
+                };
+                if position == 1 {
+                    coeff *= node_challenges[level][pair_idx];
                 }
-                PcoFoldPathProof {
-                    root,
-                    membership: tree.membership_proof(leaf_idx),
-                    steps,
-                }
-            })
-            .collect();
+                steps.push(PcoFoldPathStep { sibling });
+                cur = pair_idx;
+            }
+            paths.push(PcoFoldPathProof {
+                root,
+                membership: tree.membership_proof(leaf_idx),
+                steps,
+            });
+            coeffs.push(coeff);
+        }
 
-        (root_pair, paths)
+        (root_stmt, paths, coeffs)
+    }
+
+    /// Prover side. All input statements must share the same evaluation
+    /// point `x` (precondition); panics otherwise. Builds the single root
+    /// witness `Σ_i coeff_i · leaf_wit_i` in one pass — no intermediate node
+    /// polynomials.
+    pub fn fold_amortized(
+        leaves: Vec<(PcoStatement, PcoWitness)>,
+        transcript: &mut Blake3Transcript,
+    ) -> ((PcoStatement, PcoWitness), Vec<PcoFoldPathProof>) {
+        assert_shared_point(&leaves);
+        let leaf_stmts: Vec<PcoStatement> = leaves.iter().map(|(s, _)| s.clone()).collect();
+
+        let (root_stmt, paths, coeffs) = Self::fold_stmts(&leaf_stmts, transcript);
+
+        let mut root_poly = SparsePolynomial::<Fr>::zero();
+        for ((_, wit), &coeff) in leaves.iter().zip(&coeffs) {
+            let scaled = &wit.polynomial * coeff;
+            root_poly = &root_poly + &scaled;
+        }
+
+        ((root_stmt, PcoWitness { polynomial: root_poly }), paths)
     }
 
     /// Per-leaf verifier. Returns `true` iff:
@@ -182,6 +219,16 @@ impl PcoFold {
 fn assert_shared_point(leaves: &[(PcoStatement, PcoWitness)]) {
     let x = leaves[0].0.point;
     for (s, _) in &leaves[1..] {
+        assert_eq!(
+            s.point, x,
+            "all inputs of PcoFold must share the same evaluation point"
+        );
+    }
+}
+
+fn assert_shared_point_stmts(stmts: &[PcoStatement]) {
+    let x = stmts[0].point;
+    for s in &stmts[1..] {
         assert_eq!(
             s.point, x,
             "all inputs of PcoFold must share the same evaluation point"

@@ -84,13 +84,20 @@ def main():
             print(f"warning: no data for n={n}", file=sys.stderr)
             continue
 
+        # Render n as 2^i when it's a power of two (the common case).
+        n_int = int(n)
+        if n_int > 0 and (n_int & (n_int - 1)) == 0:
+            n_label = f"$n = 2^{{{n_int.bit_length() - 1}}}$"
+        else:
+            n_label = f"n = {n_int}"
+
         pivot_prove = sub.pivot(index="k", columns="side", values="prove_ms")
         pivot_verify = sub.pivot(index="k", columns="side", values="verify_ms")
 
         plot_panel(
             axes[0, col],
             pivot_prove,
-            f"Server (Prover), n = {n}",
+            f"Server (Prover), {n_label}",
             "server time (ms)",
             side1_label="Side 1: K lincheck proofs",
             side2_label="Side 2: amortize + 1 lincheck proof",
@@ -98,7 +105,7 @@ def main():
         plot_panel(
             axes[1, col],
             pivot_verify,
-            f"Local party (Verifier), n = {n}",
+            f"Local party (Verifier), {n_label}",
             "per-verifier time (ms)",
             side1_label="Side 1: 1 lincheck verify",
             side2_label="Side 2: 1 path + RokP + lincheck verify",

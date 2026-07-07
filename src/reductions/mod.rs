@@ -1,4 +1,5 @@
 pub mod abc_fold;
+pub mod discharge;
 pub mod fsmt_pcc;
 pub mod pco_fold;
 mod poly_util;
@@ -11,7 +12,9 @@ pub mod rok_pco;
 #[allow(unused_imports)] // public surface, no internal consumer in this binary crate
 pub use abc_fold::{AbcFold, AbcFoldPathProof, AbcFoldPathStep};
 #[allow(unused_imports)] // public surface, no internal consumer in this binary crate
-pub use fsmt_pcc::{FsMtPcc, FsMtPccProof};
+pub use discharge::{prove_discharge, DischargeProof};
+#[allow(unused_imports)] // public surface, no internal consumer in this binary crate
+pub use fsmt_pcc::{FsMtPcc, FsMtPccProof, LeafWitnessRecipe};
 #[allow(unused_imports)] // public surface, no internal consumer in this binary crate
 pub use pco_fold::{PcoFold, PcoFoldPathProof, PcoFoldPathStep};
 #[allow(unused_imports)] // public surface, no internal consumer in this binary crate
