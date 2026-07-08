@@ -2,7 +2,7 @@ pub mod abc_fold;
 pub mod discharge;
 pub mod fsmt_pcc;
 pub mod pco_fold;
-mod poly_util;
+pub(crate) mod poly_util;
 pub mod rok_abc;
 pub mod rok_dt;
 pub mod rok_p;

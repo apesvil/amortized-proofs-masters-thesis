@@ -221,9 +221,8 @@ impl RokP {
         transcript.absorb(b"rok_p::c_q1_shift", &c_q1_shift);
 
         let beta: Fr = transcript.squeeze_field(b"rok_p::beta");
-        let eta_p: Fr = transcript.squeeze_field(b"rok_p::eta_p");
 
-        // --- Evaluations at β.
+        // --- Evaluations at β (the round-3 prover message).
         let ev_n_u = wit.n_u.evaluate(&beta);
         let ev_t_u = wit.t_u.evaluate(&beta);
         let ev_n_v = wit.n_v.evaluate(&beta);
@@ -241,6 +240,15 @@ impl RokP {
         let mu_c = mu_at(&params.matrix_c, &lambda_alpha_vec, &lambda_beta_vec);
         // Combined claim shipped to R_P (and used by the verifier in G(β)).
         let y_combined = mu_a + eta * mu_b + eta2 * mu_c;
+
+        // Bind every claim the η'-batch combines BEFORE deriving η'.
+        absorb_beta_round_claims(
+            transcript,
+            ev_n_u, ev_t_u, ev_n_v, ev_t_v,
+            ev_w_a, ev_w_b, ev_w_c, ev_q0, ev_q1,
+            y_combined,
+        );
+        let eta_p: Fr = transcript.squeeze_field(b"rok_p::eta_p");
 
         // --- Batched polynomial, commitment, and value.
         // Mixed sparse (N/T) + dense (w, q) sources — accumulate into a single
@@ -352,6 +360,14 @@ impl RokP {
         transcript.absorb(b"rok_p::c_q1_shift", &proof.c_q1_shift);
 
         let beta: Fr = transcript.squeeze_field(b"rok_p::beta");
+
+        // Mirror the prover: bind the claimed evaluations and y before η'.
+        absorb_beta_round_claims(
+            transcript,
+            proof.ev_n_u, proof.ev_t_u, proof.ev_n_v, proof.ev_t_v,
+            proof.ev_w_a, proof.ev_w_b, proof.ev_w_c, proof.ev_q0, proof.ev_q1,
+            proof.y,
+        );
         let eta_p: Fr = transcript.squeeze_field(b"rok_p::eta_p");
 
         // Edge cases.
@@ -561,6 +577,32 @@ fn batched_evals(
     ]
 }
 
+/// Absorb the β-round claims (nine evaluations plus the combined μ claim `y`)
+/// before squeezing the batching challenge η'. η' must be derived after every
+/// value it linearly combines is fixed: if the prover knows η' first, it can
+/// move claims within the kernel of the η'-weighting — voiding per-slot
+/// binding and, with it, the X-shift degree enforcement (see
+/// `tests::kernel_forgery_on_y_rejected`).
+#[allow(clippy::too_many_arguments)]
+fn absorb_beta_round_claims(
+    t: &mut Blake3Transcript,
+    ev_n_u: Fr, ev_t_u: Fr, ev_n_v: Fr, ev_t_v: Fr,
+    ev_w_a: Fr, ev_w_b: Fr, ev_w_c: Fr,
+    ev_q0: Fr, ev_q1: Fr,
+    y: Fr,
+) {
+    t.absorb(b"rok_p::ev_n_u", &ev_n_u);
+    t.absorb(b"rok_p::ev_t_u", &ev_t_u);
+    t.absorb(b"rok_p::ev_n_v", &ev_n_v);
+    t.absorb(b"rok_p::ev_t_v", &ev_t_v);
+    t.absorb(b"rok_p::ev_w_a", &ev_w_a);
+    t.absorb(b"rok_p::ev_w_b", &ev_w_b);
+    t.absorb(b"rok_p::ev_w_c", &ev_w_c);
+    t.absorb(b"rok_p::ev_q0", &ev_q0);
+    t.absorb(b"rok_p::ev_q1", &ev_q1);
+    t.absorb(b"rok_p::y", &y);
+}
+
 fn absorb_abc_statement(t: &mut Blake3Transcript, s: &AbcStatement) {
     t.absorb(b"rok_p::abc_c_n_u", &s.c_n_u);
     t.absorb(b"rok_p::abc_c_t_u", &s.c_t_u);
@@ -715,5 +757,136 @@ mod tests {
 
         let mut t_v = Blake3Transcript::new(b"rok_p::label_b");
         assert!(RokP::verify(&params, &stmt, &proof, &mut t_v).is_none());
+    }
+
+    /// Uncoordinated tampering of the (ev_q0, ev_q1) pair must be rejected.
+    #[test]
+    fn tampered_ev_pair_rejected() {
+        let (params, stmt, wit) = identity_leaf(4);
+        let mut t_p = Blake3Transcript::new(b"rok_p::test");
+        let (_, _, _, mut proof) = RokP::reduce(&params, &stmt, &wit, &mut t_p);
+        proof.ev_q0 += Fr::from(3u64);
+        proof.ev_q1 -= Fr::from(5u64);
+
+        let mut t_v = Blake3Transcript::new(b"rok_p::test");
+        assert!(RokP::verify(&params, &stmt, &proof, &mut t_v).is_none());
+    }
+
+    /// The η'-ordering regression. Before the fix, η' was squeezed *before*
+    /// the claimed evaluations were absorbed, so a prover knowing η' could
+    /// claim a false `y` (the R_P output!) and shift `(ev_q0, ev_q1)` inside
+    /// the kernel of the η'-weighting: the sumcheck identity re-balances,
+    /// while the batched commitment and value stay bit-identical — so the
+    /// honest opening still verifies.
+    ///
+    /// Part (a) proves the forgery is real: with the pre-fix η' (replayed
+    /// from the commitment-only transcript) the forged claims satisfy both
+    /// the sumcheck identity and the batched value, i.e. the pre-fix
+    /// verifier accepts them with the honest opening. Part (b) asserts the
+    /// fixed verifier rejects the same forgery, because η' now depends on
+    /// the claims themselves.
+    #[test]
+    fn kernel_forgery_on_y_rejected() {
+        let (params, stmt, wit) = identity_leaf(4);
+        let n = params.n;
+        let n_fr = Fr::from(n as u64);
+        let big_d = params.srs.powers_g1.len();
+
+        let mut t_p = Blake3Transcript::new(b"rok_p::test");
+        let (_, _, _, proof) = RokP::reduce(&params, &stmt, &wit, &mut t_p);
+
+        // --- Attacker replay: challenges up to β depend only on statement
+        // and commitments; the PRE-FIX η' followed β with no ev absorbs.
+        let mut t = Blake3Transcript::new(b"rok_p::test");
+        absorb_abc_statement(&mut t, &stmt);
+        t.absorb(b"rok_p::c_w_a", &proof.c_w_a);
+        t.absorb(b"rok_p::c_w_b", &proof.c_w_b);
+        t.absorb(b"rok_p::c_w_c", &proof.c_w_c);
+        t.absorb(b"rok_p::c_w_a_shift", &proof.c_w_a_shift);
+        t.absorb(b"rok_p::c_w_b_shift", &proof.c_w_b_shift);
+        t.absorb(b"rok_p::c_w_c_shift", &proof.c_w_c_shift);
+        t.absorb(b"rok_p::c_n_u_shift", &proof.c_n_u_shift);
+        t.absorb(b"rok_p::c_t_u_shift", &proof.c_t_u_shift);
+        t.absorb(b"rok_p::c_n_v_shift", &proof.c_n_v_shift);
+        t.absorb(b"rok_p::c_t_v_shift", &proof.c_t_v_shift);
+        let _alpha: Fr = t.squeeze_field(b"rok_p::alpha");
+        let eta: Fr = t.squeeze_field(b"rok_p::eta");
+        t.absorb(b"rok_p::c_q0", &proof.c_q0);
+        t.absorb(b"rok_p::c_q1", &proof.c_q1);
+        t.absorb(b"rok_p::c_q0_shift", &proof.c_q0_shift);
+        t.absorb(b"rok_p::c_q1_shift", &proof.c_q1_shift);
+        let beta: Fr = t.squeeze_field(b"rok_p::beta");
+        let eta_p_prefix: Fr = t.squeeze_field(b"rok_p::eta_p");
+
+        // --- Solve the 2×2 system for Δy = 1:
+        //   sumcheck row: β·δ0 + (β^n − 1)·δ1 = −v(β)·η³
+        //   batch row   : (η'^7 + s_q·η'^16)·δ0 + (η'^8 + s_q·η'^17)·δ1 = 0
+        let eta2 = eta * eta;
+        let eta3 = eta2 * eta;
+        let v_at_beta = proof.ev_n_v * (n_fr * proof.ev_t_v).inverse().unwrap();
+        let beta_n = pow_usize(beta, n);
+        let s_q = pow_usize(beta, big_d - (n - 1)); // strict_d_q = n − 1
+        let a_coef = eta_p_prefix.pow([7u64]) + s_q * eta_p_prefix.pow([16u64]);
+        let b_coef = eta_p_prefix.pow([8u64]) + s_q * eta_p_prefix.pow([17u64]);
+        let ratio = b_coef * a_coef.inverse().unwrap();
+        let denom = (beta_n - Fr::one()) - beta * ratio;
+        let delta1 = -v_at_beta * eta3 * denom.inverse().unwrap();
+        let delta0 = -ratio * delta1;
+
+        let mut forged = proof.clone();
+        forged.y += Fr::one();
+        forged.ev_q0 += delta0;
+        forged.ev_q1 += delta1;
+
+        // --- (a) The pre-fix verifier accepts this forgery.
+        // (a1) The forged claims satisfy the sumcheck identity at β.
+        {
+            let u_at_beta = forged.ev_n_u * (n_fr * forged.ev_t_u).inverse().unwrap();
+            let alpha_n = pow_usize(_alpha, n);
+            let n_inv = n_fr.inverse().unwrap();
+            let lambda_alpha_beta = ((beta_n - Fr::one()) * _alpha
+                - (alpha_n - Fr::one()) * beta)
+                * (n_inv * (beta - _alpha).inverse().unwrap());
+            let ev_w = forged.ev_w_a + eta * forged.ev_w_b + eta2 * forged.ev_w_c;
+            let g_at_beta = (u_at_beta + eta3 * lambda_alpha_beta) * ev_w
+                - v_at_beta * eta3 * forged.y;
+            let y_sum = stmt.y_a + eta * stmt.y_b + eta2 * stmt.y_c;
+            let rhs = y_sum * n_inv
+                + beta * forged.ev_q0
+                + (beta_n - Fr::one()) * forged.ev_q1;
+            assert_eq!(g_at_beta, rhs, "forged sumcheck identity must hold");
+        }
+        // (a2) Under the pre-fix η', the batched value is unchanged (the
+        // perturbation lies in the kernel), and the commitments are untouched
+        // — so the honest batched opening verifies the forged claims too.
+        {
+            let strict = (stmt.d_n_u + 1, stmt.d_t_u + 1, stmt.d_n_v + 1, stmt.d_t_v + 1);
+            let evals_honest = batched_evals(
+                beta, proof.ev_n_u, proof.ev_t_u, proof.ev_n_v, proof.ev_t_v,
+                proof.ev_w_a, proof.ev_w_b, proof.ev_w_c, proof.ev_q0, proof.ev_q1,
+                big_d, strict.0, strict.1, strict.2, strict.3, n, n - 1,
+            );
+            let evals_forged = batched_evals(
+                beta, forged.ev_n_u, forged.ev_t_u, forged.ev_n_v, forged.ev_t_v,
+                forged.ev_w_a, forged.ev_w_b, forged.ev_w_c, forged.ev_q0, forged.ev_q1,
+                big_d, strict.0, strict.1, strict.2, strict.3, n, n - 1,
+            );
+            let mut v_honest = Fr::zero();
+            let mut v_forged = Fr::zero();
+            let mut pow = Fr::one();
+            for (h, f) in evals_honest.iter().zip(&evals_forged) {
+                v_honest += *h * pow;
+                v_forged += *f * pow;
+                pow *= eta_p_prefix;
+            }
+            assert_eq!(
+                v_honest, v_forged,
+                "forged claims must batch to the same value under the pre-fix η'"
+            );
+        }
+
+        // --- (b) The fixed verifier rejects it.
+        let mut t_v = Blake3Transcript::new(b"rok_p::test");
+        assert!(RokP::verify(&params, &stmt, &forged, &mut t_v).is_none());
     }
 }
