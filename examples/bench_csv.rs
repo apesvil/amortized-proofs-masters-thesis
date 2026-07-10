@@ -394,7 +394,9 @@ fn main() {
         }
     }
 
-    let body = rows.join("\n");
+    // Trailing newline so the file is a well-formed CSV and stays parseable
+    // when concatenated with other runs (each row on its own physical line).
+    let body = format!("{}\n", rows.join("\n"));
     match args.out {
         Some(path) => {
             File::create(&path)
@@ -403,6 +405,6 @@ fn main() {
                 .expect("write output");
             eprintln!("wrote {path}");
         }
-        None => println!("{body}"),
+        None => print!("{body}"),
     }
 }
