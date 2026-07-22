@@ -28,6 +28,7 @@ use amortized_proofs_masters_thesis::reductions::rok_p::RokP;
 use amortized_proofs_masters_thesis::relations::abc::{
     leaf_instance, AbcParams, AbcStatement, AbcWitness,
 };
+use amortized_proofs_masters_thesis::relations::abc_leaf_pcc::full_pcc_bundles;
 use amortized_proofs_masters_thesis::relations::p::PStatement;
 use amortized_proofs_masters_thesis::relations::pcc::{PccParams, PccStatement, PccWitness};
 use amortized_proofs_masters_thesis::transcript::Blake3Transcript;
@@ -96,11 +97,21 @@ fn synthetic_claims(setup: &Setup, k: usize) -> Vec<PStatement> {
 }
 
 /// `K` random leaves for the amortization side.
-fn random_leaves(setup: &Setup, k: usize) -> Vec<(AbcStatement, AbcWitness)> {
+/// K random leaves plus the `(α, β)` challenge that generated each — needed to
+/// build the per-leaf leaf-encoding-correctness R_PCC promise.
+fn random_leaves(
+    setup: &Setup,
+    k: usize,
+) -> (Vec<(AbcStatement, AbcWitness)>, Vec<(Fr, Fr)>) {
     let rng = &mut test_rng();
-    (0..k)
-        .map(|_| leaf_instance(&setup.abc_params, Fr::rand(rng), Fr::rand(rng)))
-        .collect()
+    let mut leaves = Vec::with_capacity(k);
+    let mut challenges = Vec::with_capacity(k);
+    for _ in 0..k {
+        let (alpha, beta) = (Fr::rand(rng), Fr::rand(rng));
+        leaves.push(leaf_instance(&setup.abc_params, alpha, beta));
+        challenges.push((alpha, beta));
+    }
+    (leaves, challenges)
 }
 
 /// Side 1: `K` independent linchecks on K synthetic R_P claims.
@@ -131,7 +142,7 @@ fn bench_side_2(c: &mut Criterion) {
     let pcc_params = PccParams { srs: setup.srs.clone() };
     let mut group = c.benchmark_group("side_2_amortize_plus_lincheck");
     for &k in K_VALUES_AMORTIZED {
-        let leaves = random_leaves(&setup, k);
+        let (leaves, challenges) = random_leaves(&setup, k);
         group.bench_with_input(BenchmarkId::from_parameter(k), &k, |b, _| {
             b.iter_batched(
                 || leaves.clone(),
@@ -141,13 +152,16 @@ fn bench_side_2(c: &mut Criterion) {
                     let (root, _paths, bundles) =
                         AbcFold::prove(&setup.abc_params, leaves, &mut t_fold);
 
-                    // 2. Discharge promises with a single materialized root
-                    //    witness + one KZG opening.
-                    let pcc_stmts: Vec<Vec<PccStatement>> = bundles
+                    // 2. Append each leaf's encoding-correctness promise
+                    //    (κ → κ+1), then discharge with a single materialized
+                    //    root witness + one KZG opening.
+                    let full =
+                        full_pcc_bundles(&pcc_params, setup.n, &challenges, bundles);
+                    let pcc_stmts: Vec<Vec<PccStatement>> = full
                         .iter()
                         .map(|bd| bd.iter().map(|(s, _)| s.clone()).collect())
                         .collect();
-                    let pcc_wits: Vec<Vec<PccWitness>> = bundles
+                    let pcc_wits: Vec<Vec<PccWitness>> = full
                         .into_iter()
                         .map(|bd| bd.into_iter().map(|(_, w)| w).collect())
                         .collect();
@@ -200,7 +214,7 @@ fn bench_amortize_only(c: &mut Criterion) {
     let setup = build_setup(N);
     let mut group = c.benchmark_group("amortize_only");
     for &k in K_VALUES_AMORTIZED {
-        let leaves = random_leaves(&setup, k);
+        let (leaves, _challenges) = random_leaves(&setup, k);
         group.bench_with_input(BenchmarkId::from_parameter(k), &k, |b, _| {
             b.iter_batched(
                 || leaves.clone(),

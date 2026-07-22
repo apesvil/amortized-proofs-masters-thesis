@@ -194,6 +194,31 @@ mod tests {
         (params, leaves)
     }
 
+    /// Like `k_leaves`, but also returns the `(α, β)` challenge behind each
+    /// leaf (needed to build/reconstruct the leaf-correctness promise).
+    fn k_leaves_with_challenges(
+        k: usize,
+        n: usize,
+    ) -> (AbcParams, Vec<(AbcStatement, AbcWitness)>, Vec<(Fr, Fr)>) {
+        let rng = &mut test_rng();
+        let a: Vec<(usize, usize, Fr)> =
+            (0..n).map(|i| (i, i, Fr::from(1u64))).collect();
+        let b: Vec<(usize, usize, Fr)> =
+            (0..n).map(|i| (i, (i + 1) % n, Fr::from(1u64))).collect();
+        let c: Vec<(usize, usize, Fr)> =
+            (0..n).map(|i| (i, i, Fr::rand(rng))).collect();
+        let srs = pc::setup(40, rng);
+        let params = AbcParams { srs, matrix_a: a, matrix_b: b, matrix_c: c, n };
+        let mut leaves = Vec::with_capacity(k);
+        let mut challenges = Vec::with_capacity(k);
+        for _ in 0..k {
+            let (alpha, beta) = (Fr::rand(rng), Fr::rand(rng));
+            leaves.push(leaf_instance(&params, alpha, beta));
+            challenges.push((alpha, beta));
+        }
+        (params, leaves, challenges)
+    }
+
     #[test]
     fn fold_roundtrip_k4() {
         let (params, leaves) = k_leaves(4, 4);
@@ -322,5 +347,69 @@ mod tests {
                     .expect("FsMtPcc verify must succeed");
             assert_eq!(*prover_pco, pco_v);
         }
+    }
+
+    /// Full sound Side-2 discharge including the per-leaf encoding-correctness
+    /// promise: κ+1 promises per leaf go through `full_pcc_bundles` →
+    /// `prove_discharge`, and every local verifier reconstructs its own
+    /// leaf-correctness statement, matches the prover's bundle, and checks the
+    /// FsMtPcc + PcoFold + KZG-opening chain.
+    #[test]
+    fn end_to_end_with_leaf_correctness() {
+        use crate::reductions::discharge::prove_discharge;
+        use crate::reductions::fsmt_pcc::FsMtPcc;
+        use crate::reductions::pco_fold::PcoFold;
+        use crate::relations::abc_leaf_pcc::{full_pcc_bundles, leaf_correctness_pcc};
+
+        let (params, leaves, challenges) = k_leaves_with_challenges(4, 4);
+        let leaf_stmts: Vec<AbcStatement> =
+            leaves.iter().map(|(s, _)| s.clone()).collect();
+        let pcc_params = PccParams { srs: params.srs.clone() };
+
+        let mut t = Blake3Transcript::new(b"test");
+        let (root, paths, bundles) = AbcFold::prove(&params, leaves, &mut t);
+        assert!(AbcRelation::is_satisfied(&params, &root.0, &root.1));
+
+        // Append each leaf's encoding-correctness promise → κ+1 per leaf.
+        let full = full_pcc_bundles(&pcc_params, params.n, &challenges, bundles);
+        let pcc_stmts: Vec<Vec<PccStatement>> = full
+            .iter()
+            .map(|b| b.iter().map(|(s, _)| s.clone()).collect())
+            .collect();
+        let pcc_wits: Vec<Vec<PccWitness>> = full
+            .into_iter()
+            .map(|b| b.into_iter().map(|(_, w)| w).collect())
+            .collect();
+
+        let mut t_f = Blake3Transcript::new(b"fsmt");
+        let mut t_p = Blake3Transcript::new(b"pco");
+        let d = prove_discharge(&pcc_params, &pcc_stmts, &pcc_wits, &mut t_f, &mut t_p);
+
+        for i in 0..pcc_stmts.len() {
+            let mut t_v = Blake3Transcript::new(b"test");
+            let mut promises =
+                AbcFold::verify(&params, i, &leaf_stmts[i], &paths[i], &root.0, &mut t_v)
+                    .expect("AbcFold verify");
+            promises.push(
+                leaf_correctness_pcc(&pcc_params, params.n, challenges[i].0, challenges[i].1).0,
+            );
+            // Verifier's reconstructed bundle must match what the prover discharged.
+            assert_eq!(promises, pcc_stmts[i]);
+
+            let mut t_fv = Blake3Transcript::new(b"fsmt");
+            let leaf_pco =
+                FsMtPcc::verify(&pcc_params, i, &promises, &d.fsmt_proofs[i], &mut t_fv)
+                    .expect("FsMtPcc verify");
+            let mut t_pv = Blake3Transcript::new(b"pco");
+            assert!(PcoFold::verify(i, &leaf_pco, &d.pco_paths[i], &d.root_stmt, &mut t_pv));
+        }
+
+        assert!(pc::verify(
+            &params.srs,
+            &d.root_stmt.commitment,
+            d.root_stmt.point,
+            d.root_stmt.value,
+            &d.opening,
+        ));
     }
 }

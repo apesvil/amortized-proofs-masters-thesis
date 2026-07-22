@@ -56,6 +56,9 @@ use amortized_proofs_masters_thesis::reductions::rok_p::RokP;
 use amortized_proofs_masters_thesis::relations::abc::{
     leaf_instance, AbcParams, AbcStatement, AbcWitness,
 };
+use amortized_proofs_masters_thesis::relations::abc_leaf_pcc::{
+    full_pcc_bundles, leaf_correctness_pcc,
+};
 use amortized_proofs_masters_thesis::relations::p::PStatement;
 use amortized_proofs_masters_thesis::relations::pcc::{PccParams, PccStatement, PccWitness};
 use amortized_proofs_masters_thesis::transcript::Blake3Transcript;
@@ -187,11 +190,22 @@ fn synthetic_claims(setup: &Setup, k: usize) -> Vec<PStatement> {
         .collect()
 }
 
-fn random_leaves(setup: &Setup, k: usize) -> Vec<(AbcStatement, AbcWitness)> {
+/// K random leaves plus the `(α, β)` challenge that generated each — the
+/// challenges are needed to build (prover) and reconstruct (verifier) the
+/// per-leaf leaf-encoding-correctness R_PCC promise.
+fn random_leaves(
+    setup: &Setup,
+    k: usize,
+) -> (Vec<(AbcStatement, AbcWitness)>, Vec<(Fr, Fr)>) {
     let rng = &mut test_rng();
-    (0..k)
-        .map(|_| leaf_instance(&setup.abc_params, Fr::rand(rng), Fr::rand(rng)))
-        .collect()
+    let mut leaves = Vec::with_capacity(k);
+    let mut challenges = Vec::with_capacity(k);
+    for _ in 0..k {
+        let (alpha, beta) = (Fr::rand(rng), Fr::rand(rng));
+        leaves.push(leaf_instance(&setup.abc_params, alpha, beta));
+        challenges.push((alpha, beta));
+    }
+    (leaves, challenges)
 }
 
 fn median(mut xs: Vec<f64>) -> f64 {
@@ -226,13 +240,19 @@ fn time_side_1(setup: &Setup, claims: &[PStatement]) -> (f64, f64) {
 
 /// Returns (server_prove_ms, per_verifier_verify_ms) for Side 2.
 ///
-/// Server (K > 1): AbcFold → discharge the K·κ fold promises via FsMtPcc +
-/// PcoFold + one KZG opening → RokP + 1 lincheck on the root. Each of the K
-/// local verifiers checks its own fold path, its promise discharge (FsMtPcc +
-/// PcoFold + the shared opening), the RokP reduction, and the lincheck — we
-/// measure one representative (leaf 0). At K = 1 there is no fold and no
-/// promise to discharge, so only RokP + 1 lincheck run.
-fn time_side_2(setup: &Setup, leaves: Vec<(AbcStatement, AbcWitness)>) -> (f64, f64) {
+/// Server (K > 1): AbcFold → append each leaf's encoding-correctness promise
+/// (κ+1 R_PCC per leaf) → discharge them all via FsMtPcc + PcoFold + one KZG
+/// opening → RokP + 1 lincheck on the root. Each of the K local verifiers
+/// checks its own fold path, reconstructs its own leaf-correctness promise,
+/// checks the promise discharge (FsMtPcc + PcoFold + the shared opening), the
+/// RokP reduction, and the lincheck — we measure one representative (leaf 0).
+/// At K = 1 there is no fold and no promise to discharge, so only RokP + 1
+/// lincheck run.
+fn time_side_2(
+    setup: &Setup,
+    leaves: Vec<(AbcStatement, AbcWitness)>,
+    challenges: &[(Fr, Fr)],
+) -> (f64, f64) {
     let k = leaves.len();
     let leaf_stmts: Vec<AbcStatement> = leaves.iter().map(|(s, _)| s.clone()).collect();
     let pcc_params = PccParams { srs: setup.srs.clone() };
@@ -256,19 +276,21 @@ fn time_side_2(setup: &Setup, leaves: Vec<(AbcStatement, AbcWitness)>) -> (f64, 
         (root.0, root.1, paths, bundles)
     };
 
-    // 2. Discharge the promises: FsMt(Π_PC ∘ Π_DT) → K R_PCO claims at a shared
-    //    point x; PcoFold → 1 root R_PCO; one KZG opening proves it. A single
-    //    root witness is assembled directly (see `reductions::discharge`), so
-    //    the K per-leaf witnesses are never materialized. (No-op at K = 1,
+    // 2. Append each leaf's encoding-correctness promise (κ → κ+1 per leaf),
+    //    then discharge them all: FsMt(Π_PC ∘ Π_DT) → K R_PCO claims at a
+    //    shared point x; PcoFold → 1 root R_PCO; one KZG opening proves it. A
+    //    single root witness is assembled directly (see `reductions::discharge`),
+    //    so the K per-leaf witnesses are never materialized. (No-op at K = 1,
     //    where there are no promises.)
     let discharge = if k == 1 {
         None
     } else {
-        let pcc_stmts: Vec<Vec<PccStatement>> = pcc_bundles
+        let full = full_pcc_bundles(&pcc_params, setup.n, challenges, pcc_bundles);
+        let pcc_stmts: Vec<Vec<PccStatement>> = full
             .iter()
             .map(|b| b.iter().map(|(s, _)| s.clone()).collect())
             .collect();
-        let pcc_wits: Vec<Vec<PccWitness>> = pcc_bundles
+        let pcc_wits: Vec<Vec<PccWitness>> = full
             .into_iter()
             .map(|b| b.into_iter().map(|(_, w)| w).collect())
             .collect();
@@ -306,13 +328,19 @@ fn time_side_2(setup: &Setup, leaves: Vec<(AbcStatement, AbcWitness)>) -> (f64, 
             .expect("AbcFold verify")
     };
 
-    // 2. Discharge-side verify: FsMtPcc reconstructs this leaf's R_PCO claim at
-    //    x, PcoFold checks it folds into the shared root, and the final KZG
-    //    opening is checked once.
+    // 2. Discharge-side verify: reconstruct this leaf's own encoding-correctness
+    //    promise (appended last, matching `full_pcc_bundles`), then FsMtPcc
+    //    reconstructs this leaf's R_PCO claim at x, PcoFold checks it folds into
+    //    the shared root, and the final KZG opening is checked once.
     if let Some(d) = &discharge {
+        let mut promises = promises_0.clone();
+        promises.push(
+            leaf_correctness_pcc(&pcc_params, setup.n, challenges[0].0, challenges[0].1).0,
+        );
+
         let mut t_fsmtv = Blake3Transcript::new(b"bench::s2::fsmt");
         let leaf_pco_0 =
-            FsMtPcc::verify(&pcc_params, 0, &promises_0, &d.fsmt_proofs[0], &mut t_fsmtv)
+            FsMtPcc::verify(&pcc_params, 0, &promises, &d.fsmt_proofs[0], &mut t_fsmtv)
                 .expect("FsMtPcc verify");
 
         let mut t_pcofoldv = Blake3Transcript::new(b"bench::s2::pcofold");
@@ -374,13 +402,13 @@ fn main() {
                 median(v_v)
             ));
 
-            // --- Side 2: AbcFold + RokP + 1 lincheck
-            let leaves = random_leaves(&setup, k);
-            let _ = time_side_2(&setup, leaves.clone()); // warmup
+            // --- Side 2: AbcFold + promise discharge + RokP + 1 lincheck
+            let (leaves, challenges) = random_leaves(&setup, k);
+            let _ = time_side_2(&setup, leaves.clone(), &challenges); // warmup
             let mut p_v: Vec<f64> = Vec::with_capacity(args.reps);
             let mut v_v: Vec<f64> = Vec::with_capacity(args.reps);
             for _ in 0..args.reps {
-                let (p, v) = time_side_2(&setup, leaves.clone());
+                let (p, v) = time_side_2(&setup, leaves.clone(), &challenges);
                 p_v.push(p);
                 v_v.push(v);
             }

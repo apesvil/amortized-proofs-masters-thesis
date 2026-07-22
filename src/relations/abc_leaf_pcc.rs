@@ -64,16 +64,13 @@ pub fn leaf_correctness_pcc(
     let c_n_v = pc::commit(&params.srs, &Poly::Sparse(n_v.clone()));
     let c_t_v = pc::commit(&params.srs, &Poly::Sparse(t_v.clone()));
 
-    let alpha_to_n = alpha_n_minus_1 + Fr::from(1u64);
-    let beta_to_n = beta_n_minus_1 + Fr::from(1u64);
-
     let q_u = Constraint {
         monomials: vec![
             Monomial { coeff: Fr::from(1u64), x_deg: 1, y_terms: vec![(0, 1)] },
             Monomial { coeff: -alpha,         x_deg: 0, y_terms: vec![(0, 1)] },
             Monomial { coeff: -alpha,         x_deg: n, y_terms: vec![(1, 1)] },
             Monomial { coeff:  alpha,         x_deg: 0, y_terms: vec![(1, 1)] },
-            Monomial { coeff: alpha_to_n - Fr::from(1u64), x_deg: 1, y_terms: vec![(1, 1)] },
+            Monomial { coeff: alpha_n_minus_1, x_deg: 1, y_terms: vec![(1, 1)] },
         ],
     };
     let q_v = Constraint {
@@ -82,7 +79,7 @@ pub fn leaf_correctness_pcc(
             Monomial { coeff: -beta,          x_deg: 0, y_terms: vec![(2, 1)] },
             Monomial { coeff: -beta,          x_deg: n, y_terms: vec![(3, 1)] },
             Monomial { coeff:  beta,          x_deg: 0, y_terms: vec![(3, 1)] },
-            Monomial { coeff: beta_to_n - Fr::from(1u64),  x_deg: 1, y_terms: vec![(3, 1)] },
+            Monomial { coeff: beta_n_minus_1,  x_deg: 1, y_terms: vec![(3, 1)] },
         ],
     };
 
@@ -155,6 +152,45 @@ mod tests {
         let beta = Fr::rand(rng);
         let (s, w) = leaf_correctness_pcc(&p, n, alpha, beta);
         assert!(PccRelation::is_satisfied(&p, &s, &w));
+    }
+
+    /// A leaf whose N_u differs from the honest one by a multiple of the
+    /// vanishing polynomial Z_H(X) = X^n − 1 still agrees with N_u on all of H
+    /// (Z_H vanishes there) and stays within the degree bound (deg Z_H = n =
+    /// d_n_u), so it survives the spot-check + degree checks AbcRelation uses.
+    /// But it corrupts N_u(β)/(n·T_u(β)) at the random β RokP reads, and
+    /// leaf_correctness_pcc's Q_u — a full polynomial identity — rejects it.
+    #[test]
+    fn zh_multiple_forgery_rejected() {
+        use ark_poly::Polynomial;
+        let n = 4;
+        let p = params(n + 1);
+        let rng = &mut test_rng();
+        let alpha = Fr::rand(rng);
+        let beta = Fr::rand(rng);
+        let (mut s, mut w) = leaf_correctness_pcc(&p, n, alpha, beta);
+
+        // Forge N_u' = N_u + c·Z_H (c ≠ 0). Z_H = X^n − 1.
+        let z_h = SparsePolynomial::from_coefficients_vec(vec![
+            (0, -Fr::from(1u64)),
+            (n, Fr::from(1u64)),
+        ]);
+        let forged = &w.polynomials[0] + &(&z_h * Fr::from(7u64));
+
+        // Passes the checks AbcRelation uses: agrees with honest N_u on all of
+        // H, and stays within the degree bound d_n_u = n.
+        let dom = Radix2EvaluationDomain::<Fr>::new(n).unwrap();
+        for h in dom.elements() {
+            assert_eq!(forged.evaluate(&h), w.polynomials[0].evaluate(&h));
+        }
+        assert!(forged.degree() <= n);
+
+        // Self-consistent malicious witness: commitment matches the forged poly.
+        s.commitments[0] = pc::commit(&p.srs, &Poly::Sparse(forged.clone()));
+        w.polynomials[0] = forged;
+
+        // Only Q_u catches it.
+        assert!(!PccRelation::is_satisfied(&p, &s, &w));
     }
 
     #[test]
