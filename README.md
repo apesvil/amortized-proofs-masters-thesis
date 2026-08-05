@@ -1,5 +1,12 @@
 # Amortized Proofs — Master's Thesis
 
+> **Paper:** [*Amortized Multi-Verifier Proofs from Reductions of Knowledge*](https://eprint.iacr.org/2026/1553)
+> — Nikitas Paslis, Carla Ràfols, Alexandros Zacharakis.
+> Cryptology ePrint Archive, Paper 2026/1553.
+
+This repository is the reference implementation and benchmark harness for the
+construction in that paper.
+
 A Rust implementation of a **promise-carrying local folding scheme** and the
 machinery needed to benchmark it against the naïve baseline. The central
 question the code answers empirically is:
@@ -185,7 +192,9 @@ src/
 
 benches/marlin_lincheck.rs   Criterion bench: prover-side Side 1 vs Side 2
 examples/bench_csv.rs        Full pipeline (prover + verifier), CSV output
-docs/decisions/              Design notes (shared_srs, m_relation, …)
+scripts/plot_amortization.py Plots a results CSV (prover + verifier panels)
+results.csv                  Checked-in sweep, n = 2^10…2^18, K = 1…128
+amortization.png/.pdf        The plot of that sweep
 ```
 
 ---
@@ -214,10 +223,55 @@ cargo run --release --example bench_csv -- \
 Defaults: `--ns 8,16 --ks 1,2,4,8,16 --reps 5`, output to stdout. Columns are
 `n,k,side,prove_ms,verify_ms`.
 
+Plotting the sweep (needs `pandas` + `matplotlib`):
+
+```bash
+python scripts/plot_amortization.py results.csv --out amortization.pdf
+```
+
+---
+
+## Results
+
+The checked-in [`results.csv`](results.csv) is the sweep behind
+[`amortization.png`](amortization.png), covering `n = 2^10 … 2^18` and
+`K = 1 … 128` at 5 reps. Reproduce it with:
+
+```bash
+cargo run --release --example bench_csv -- \
+    --ns 1024,4096,16384,65536,262144 --ks 1,2,4,8,16,32,64,128 \
+    --reps 5 --out results.csv
+```
+
+The headline number is the crossover `K*` — the smallest batch size at which the
+Server's Side-2 (fold + one lincheck) proving time beats Side-1 (`K` independent
+linchecks):
+
+| `n`      | `K*` | Server time at `K = 128` (Side 1 → Side 2) | Speed-up |
+|----------|------|--------------------------------------------|----------|
+| `2^10`   | —    | 3.1 s → 7.6 s                              | 0.41×    |
+| `2^12`   | 4    | 10.6 s → 8.1 s                             | 1.3×     |
+| `2^14`   | 4    | 40.2 s → 9.2 s                             | 4.4×     |
+| `2^16`   | 4    | 149.9 s → 14.3 s                           | 10.5×    |
+| `2^18`   | 4    | 522.7 s → 28.6 s                           | 18.3×    |
+
+Side-1 proving is linear in `K`; Side-2 is dominated by the single lincheck on
+the folded claim, so the gap widens with both `n` and `K`. At `n = 2^10` the
+fold's fixed cost never amortizes within `K ≤ 128` — the per-job lincheck is
+already too cheap to be worth folding.
+
+The trade is on the verifier: Side-1 verification is essentially flat in both
+`n` and `K` (~4 ms, one lincheck), while Side-2 costs a fold path + `RokP` +
+lincheck and grows with `log K` — 8 ms at `K = 1` up to 513 ms at `K = 128`
+(measured at `n = 2^18`).
+
 ---
 
 ## Status / caveats
 
+- **This repository is still under active development.** Interfaces, module
+  layout, and benchmark numbers are all subject to change without notice — pin
+  a commit if you depend on any of it.
 - `R_P` is intentionally left without an `is_satisfied` impl — it is the seam
   where different discharging SNARKs plug in (see `relations/p.rs`).
 - SRS is sized for the largest `(n, K)` in a run; sizing logic and the
@@ -250,4 +304,19 @@ dual licensed as above, without any additional terms or conditions.
 
 ---
 
-*Crate: `amortized-proofs-masters-thesis` · thesis code, WIP.*
+## Citing
+
+```bibtex
+@misc{cryptoeprint:2026/1553,
+      author = {Nikitas Paslis and Carla Ràfols and Alexandros Zacharakis},
+      title = {Amortized Multi-Verifier Proofs from Reductions of Knowledge},
+      howpublished = {Cryptology {ePrint} Archive, Paper 2026/1553},
+      year = {2026},
+      url = {https://eprint.iacr.org/2026/1553}
+}
+```
+
+---
+
+*Crate: `amortized-proofs-masters-thesis` · research code accompanying
+[ePrint 2026/1553](https://eprint.iacr.org/2026/1553).*

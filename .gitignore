@@ -1,1 +1,9 @@
 /target
+/.venv
+__pycache__/
+*.pyc
+
+# Local-only: paper sources, reviewer material, and design notes. Not published.
+/localcss/
+/localcss (update)/
+/docs/
