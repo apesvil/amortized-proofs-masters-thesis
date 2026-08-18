@@ -181,6 +181,9 @@ impl FsMtPcc {
     /// PCO witness `Σ_k r^k · polys[k]`. Prefer `reductions::discharge` when
     /// only the single folded root witness is needed — this wrapper builds all
     /// K leaf witnesses and is kept for the standalone per-leaf API and tests.
+    ///
+    /// **Reference-only** — not reached by the benchmarks; the hot path calls
+    /// `reduce_amortized_stmts` via `reductions::discharge`.
     pub fn reduce_amortized(
         params: &PccParams,
         stmts: &[Vec<PccStatement>],

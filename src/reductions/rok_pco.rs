@@ -21,6 +21,10 @@ pub struct RokPco;
 impl RokPco {
     /// Prover side. All inputs must share the same evaluation point `x`
     /// (paper's `R_PCO^x` precondition); panics otherwise.
+    ///
+    /// **Reference-only** — not reached by the benchmarks. `PcoFold` uses
+    /// `fold_pair_stmt` + `verify` (both below); this witness-bearing `reduce`
+    /// is kept for tests and as the readable batch reference.
     pub fn reduce(
         stmts: &[PcoStatement],
         wits: &[PcoWitness],

@@ -1,5 +1,5 @@
 use ark_bls12_381::Fr;
-use ark_ff::Zero;
+use ark_ff::{Field, Zero};
 use ark_poly::Polynomial;
 
 use crate::relations::pcc::Constraint;
@@ -20,6 +20,11 @@ use crate::transcript::Blake3Transcript;
 /// The verifier additionally checks `Q_j(x, y) = 0` for every constraint
 /// (Schwartz–Zippel). The output is a **single** PCO instance `(C, x, y)`
 /// with witness `p(X)`.
+///
+/// **Reference-only** — this standalone reduction is not reached by the
+/// benchmarks. On the hot path `FsMtPcc` inlines Π_PC, reusing only the free
+/// helpers `evaluate_constraint` / `absorb_pcc_d_statement` (below); `reduce`
+/// and `verify` here exist for the unit tests and as the readable reference.
 pub struct RokPcc;
 
 /// Prover's wire message: the unshifted evaluation vector.
@@ -118,14 +123,17 @@ impl RokPcc {
 // ---------------------------------------------------------------------------
 
 /// Numeric `Q(x, y_1, ..., y_n)`.
+///
+/// `x_deg` reaches `D − d_i` for the degree-shift constraints `Π_DT` appends
+/// (see `rok_dt::shift_constraint`), i.e. it is on the order of the SRS size.
+/// The exponentiation is therefore done by square-and-multiply — the same way
+/// `rok_p::pow_usize` handles the identical shift exponents — not by a linear
+/// multiply loop, which would make the verifier `O(D)` per shifted commitment.
 pub(super) fn evaluate_constraint(q: &Constraint, x: Fr, y: &[Fr]) -> Fr {
     q.monomials
         .iter()
         .map(|m| {
-            let mut term = m.coeff;
-            for _ in 0..m.x_deg {
-                term *= x;
-            }
+            let mut term = m.coeff * x.pow([m.x_deg as u64]);
             for &(idx, exp) in &m.y_terms {
                 for _ in 0..exp {
                     term *= y[idx];

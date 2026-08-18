@@ -192,9 +192,15 @@ src/
 
 benches/marlin_lincheck.rs   Criterion bench: prover-side Side 1 vs Side 2
 examples/bench_csv.rs        Full pipeline (prover + verifier), CSV output
-scripts/plot_amortization.py Plots a results CSV (prover + verifier panels)
+examples/bench_verifier_csv.rs  Verifier stages + delegation baselines, CSV output
+scripts/plot_amortization.py    Plots a results CSV (prover + verifier panels)
+scripts/plot_verifier_amortization.py  Amortization-only verifier cost
+scripts/plot_delegation_gain.py        Prove-it-yourself vs. delegate-and-verify
 results.csv                  Checked-in sweep, n = 2^10…2^18, K = 1…128
+results_verifier.csv         Verifier-side sweep, same grid
 amortization.png/.pdf        The plot of that sweep
+verifier_amortization.png/.pdf  Amortization-only verifier cost
+delegation_gain.png/.pdf        Delegation gain for the local party
 ```
 
 ---
@@ -229,6 +235,27 @@ Plotting the sweep (needs `pandas` + `matplotlib`):
 python scripts/plot_amortization.py results.csv --out amortization.pdf
 ```
 
+Verifier-side sweep — the same grid, but the Side-2 prover runs **once** per
+`(n, K)` and only the local party's verification is re-timed, split into its
+stages. Minutes rather than hours, since the `K`-independent-lincheck prover
+sweep is not needed:
+
+```bash
+cargo run --release --example bench_verifier_csv -- \
+    --ns 1024,4096,16384,65536,262144 --ks 1,2,4,8,16,32,64,128 \
+    --reps 9 --out results_verifier.csv
+
+python scripts/plot_verifier_amortization.py results_verifier.csv \
+    --out verifier_amortization.pdf
+python scripts/plot_delegation_gain.py results_verifier.csv \
+    --out delegation_gain.pdf
+```
+
+Columns are `n,k` then the local party's stages (`v_stmt_prep_ms`, `v_fold_ms`,
+`v_discharge_ms`, `v_rokp_ms`, `v_lincheck_ms`, and the derived `v_amort_ms`,
+`v_total_ms`), then the no-delegation baselines (`p_local_rokp_ms`,
+`p_local_lincheck_ms`) and the no-proof reference `ref_direct_eval_ms`.
+
 ---
 
 ## Results
@@ -262,8 +289,76 @@ already too cheap to be worth folding.
 
 The trade is on the verifier: Side-1 verification is essentially flat in both
 `n` and `K` (~4 ms, one lincheck), while Side-2 costs a fold path + `RokP` +
-lincheck and grows with `log K` — 8 ms at `K = 1` up to 513 ms at `K = 128`
-(measured at `n = 2^18`).
+lincheck and grows with `log K` — 8.4 ms at `K = 1` up to 33.6 ms at `K = 128`
+(measured at `n = 2^18`, from [`results_verifier.csv`](results_verifier.csv)).
+
+> **Note.** The `verify_ms` column of [`results.csv`](results.csv), and the
+> verifier panel of `amortization.png`, predate the square-and-multiply fix in
+> `rok_pcc::evaluate_constraint` and overstate the Side-2 verifier by up to
+> ~14× at `n = 2^18`. The `prove_ms` column is unaffected — the naive
+> exponentiation was only ever on the verifier's path. Re-run `bench_csv` to
+> refresh them, or read the verifier costs off `results_verifier.csv`, which
+> was measured after the fix.
+
+### Verifier-side amortization cost
+
+Splitting the local party's work at the point where the pipeline stops being
+SNARK-agnostic — everything up to and including `RokP::verify` reads only the
+SRS and `n`, never the matrices or the lincheck index:
+
+| stage | `n = 2^10` | `n = 2^18` | scales with |
+|-------|-----------:|-----------:|-------------|
+| statement prep (4 sparse commitments) | 0.92 ms | 1.04 ms | — |
+| fold path verify                      | 0.66 ms | 0.66 ms | `log K` |
+| promise discharge                     | 24.8 ms | 24.5 ms | `log K` |
+| `RokP` verify                         | 4.16 ms | 4.15 ms | — |
+| **amortization subtotal**             | **30.6 ms** | **30.3 ms** | `log K` |
+| inner-lincheck verify                 | 3.21 ms | 3.24 ms | — |
+
+(at `K = 128`; see [`verifier_amortization.png`](verifier_amortization.png))
+
+The amortization cost is independent of `n` — the five `n` curves agree to 7%
+— and grows only with `log K`, at roughly 2.9 ms per doubling, essentially all
+of it in the promise discharge. Statement preparation is the client's own
+share: committing to its four sparse leaf polynomials. It is *not* charged the
+`O(n)` evaluation of `y_A, y_B, y_C` — that is the answer it is delegating.
+
+### Is delegating worth it for the local party?
+
+Both sides start from the same point: the moment Marlin's verifier samples `β`
+and the claim `t(β)` — this repo's `R_P` statement `(α, β, y, η)` — is still to
+be established. The baseline is the **Marlin inner sumcheck**, which
+`marlin_ahp/inner_lincheck.rs` reimplements from arkworks-rs/marlin's
+`prover_third_round`; `RokP::reduce` is deliberately *not* in it, since plain
+Marlin never runs it. See
+[`docs/decisions/marlin_baseline.md`](docs/decisions/marlin_baseline.md) for the
+correspondence and the reasoning ([`delegation_gain.png`](delegation_gain.png)):
+
+| `n`    | Marlin inner sumcheck | delegate + verify (`K = 128`) | gain | break-even |
+|--------|----------------------:|------------------------------:|-----:|-----------:|
+| `2^10` |  26.9 ms              | 33.8 ms                       | 0.8× | `K = 32`   |
+| `2^12` |  83.1 ms              | 33.6 ms                       | 2.5× | —          |
+| `2^14` | 285.4 ms              | 33.0 ms                       | 8.7× | —          |
+| `2^16` | 1009.5 ms             | 32.8 ms                       | 30.8× | —         |
+| `2^18` | 4063.4 ms             | 33.6 ms                       | 121× | —          |
+
+For reference, not plotted: running this construction *unamortized* costs
+`RokP::reduce` + lincheck = 10.8 s at `n = 2^18`, so the encoding is 2.7× a
+plain lincheck before the fold buys anything back (`p_local_rokp_ms` in the
+CSV).
+
+The 33.6 ms is the conservative reading, where the party checks the Server's
+work itself. A party that only needs to *forward* the proof to a third-party
+verifier pays statement preparation alone — 1.04 ms, a 3900× reduction — and the
+~30 ms lands on the end verifier instead. That is the additive `O(log K)`
+verifier overhead, i.e. a transfer of cost rather than a saving.
+
+The local party's delegated cost is flat in `n`, so the gain is set entirely by
+how expensive the local prove is. At `n = 2^10` the lincheck is already cheap
+enough that the amortization overhead overtakes it at `K = 32`; from `n = 2^12`
+up, delegation wins across the whole sweep. Note the gain *decreases* in `K`:
+amortization is a win for the Server, and the local party pays a `log K` premium
+for it.
 
 ---
 

@@ -139,6 +139,9 @@ impl PcoFold {
     /// point `x` (precondition); panics otherwise. Builds the single root
     /// witness `Σ_i coeff_i · leaf_wit_i` in one pass — no intermediate node
     /// polynomials.
+    ///
+    /// **Reference-only** — not reached by the benchmarks; the hot path calls
+    /// `fold_stmts` via `reductions::discharge`.
     pub fn fold_amortized(
         leaves: Vec<(PcoStatement, PcoWitness)>,
         transcript: &mut Blake3Transcript,
