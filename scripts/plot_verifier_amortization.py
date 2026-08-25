@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
 """
-Figure 1 — verifier cost of the amortization part alone.
+Figure 1 — verifier cost of the proof of inclusion.
 
-The local party's work splits at the point where the pipeline stops being
-SNARK-agnostic:
+The local party's verification splits into three parts:
 
-    amortization      = statement preparation + fold path verify
-                      + promise discharge + RokP verify
-    folded-stmt check = 1 inner-lincheck verify on the root R_P claim
+    1  proof of inclusion  = statement preparation + fold path verify
+                           + promise discharge
+    2  RokP verify         (root R_{A,B,C} -> R_P)
+    3  folded lincheck verify
 
-Everything in the first group reads only the SRS and n, so it is independent of
-which SNARK discharges the final R_P claim; only the lincheck is Marlin-specific.
-This figure plots the first group, excluding the lincheck entirely.
+**This figure plots part 1 only.** Parts 2 and 3 are a fixed ~7.4 ms tail, flat
+in both n and K, so excluding them leaves exactly the term that amortization
+adds per participating party — the one that grows with log K.
 
-Left panel: amortization cost vs K, one line per n.
-Right panel: stage composition for one n, so the O(n) statement-preparation term
-and the log K part of the amortization are separable by eye.
+Left panel: cost vs K, one line per n.
+Right panel: stage composition for one n, so the statement-preparation term and
+the log K part are separable by eye.
 
 Input: CSV from `cargo run --release --example bench_verifier_csv`.
 
 Usage:
-    python scripts/plot_verifier_amortization.py results_verifier.csv
-    python scripts/plot_verifier_amortization.py results_verifier.csv --n 262144
-    python scripts/plot_verifier_amortization.py results_verifier.csv --no-stmt-prep
+    python scripts/plot_verifier_amortization.py results/results_verifier.csv
+    python scripts/plot_verifier_amortization.py results/results_verifier.csv --n 262144
+    python scripts/plot_verifier_amortization.py results/results_verifier.csv --no-stmt-prep
+    python scripts/plot_verifier_amortization.py results/results_verifier.csv --with-rokp
 """
 
 import argparse
@@ -37,12 +38,14 @@ SEQ_BLUE = ["#a8c7ee", "#7aa9e4", "#4d8bd9", "#2a78d6", "#17508f"]
 CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
 INK, INK_MUTED = "#0b0b0b", "#52514e"
 
+# Part 1 only. RokP (part 2) is opt-in via --with-rokp; the folded lincheck
+# (part 3) belongs to `plot_delegation_gain.py`, not here.
 STAGES = [
     ("v_stmt_prep_ms", "statement prep (4 commitments)", CAT[0]),
     ("v_fold_ms", "fold path verify", CAT[1]),
     ("v_discharge_ms", "promise discharge", CAT[2]),
-    ("v_rokp_ms", "RokP verify", CAT[3]),
 ]
+ROKP_STAGE = ("v_rokp_ms", "RokP verify", CAT[3])
 
 
 def n_label(n):
@@ -70,23 +73,27 @@ def style(ax):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("csv", help="CSV from examples/bench_verifier_csv")
-    ap.add_argument("--out", default="verifier_amortization.pdf")
+    ap.add_argument("--out", default="results/verifier_amortization.pdf")
     ap.add_argument("--n", type=int, default=None,
                     help="n for the right-hand composition panel (default: largest)")
     ap.add_argument("--no-stmt-prep", action="store_true",
                     help="exclude statement preparation, leaving the K-dependent part only")
+    ap.add_argument("--with-rokp", action="store_true",
+                    help="also include RokP verify (part 2)")
     args = ap.parse_args()
 
     df = pd.read_csv(args.csv)
     needed = {"n", "k", "v_stmt_prep_ms", "v_fold_ms", "v_discharge_ms",
-              "v_rokp_ms", "v_amort_ms"}
+              "v_rokp_ms"}
     missing = needed - set(df.columns)
     if missing:
         print(f"CSV is missing columns: {missing}", file=sys.stderr)
         sys.exit(1)
 
     df = df.copy()
-    stages = STAGES[1:] if args.no_stmt_prep else STAGES
+    stages = STAGES[1:] if args.no_stmt_prep else list(STAGES)
+    if args.with_rokp:
+        stages = stages + [ROKP_STAGE]
     df["amort"] = sum(df[c] for c, _, _ in stages)
 
     ns = sorted(df["n"].unique())
@@ -110,18 +117,23 @@ def main():
     ax.set_xscale("log", base=2)
     ax.set_xlabel("$K$ (number of amortized jobs)")
     ax.set_ylabel("per-verifier time (ms)")
-    ax.set_title("(a) Amortization only, lincheck excluded",
-                 fontsize=10, color=INK, loc="left")
+    title_a = ("(a) Proof of inclusion $+$ RokP" if args.with_rokp
+               else "(a) Proof of inclusion (part 1)")
+    ax.set_title(title_a, fontsize=10, color=INK, loc="left")
     ax.legend(fontsize=8, frameon=False, loc="upper left")
     ax.set_ylim(bottom=0)
     style(ax)
 
     if len(spread) > 1:
+        # K = 1 is excluded from the spread: with no fold the quantity is just
+        # the four commitments (~1 ms), so sub-tenth-ms noise reads as a large
+        # relative spread and would understate the n-independence.
         wide = pd.concat(spread, axis=1)
+        wide = wide[wide.index >= 2]
         worst = ((wide.max(axis=1) - wide.min(axis=1)) / wide.min(axis=1)).max()
         ax.annotate(
-            f"independent of $n$: curves agree to {worst * 100:.0f}%\n"
-            f"growth is in $\\log K$ alone",
+            f"independent of $n$: curves agree to {worst * 100:.0f}% "
+            f"for $K \\geq 2$\ngrowth is in $\\log K$ alone",
             (0.97, 0.06), xycoords="axes fraction", ha="right",
             fontsize=8.5, color=INK_MUTED,
         )

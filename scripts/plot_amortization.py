@@ -5,10 +5,18 @@ for both prover and verifier times.
 
 Input CSV columns: n, k, side, prove_ms, verify_ms
 
+`--side` splits the two rows into separate files; `--verifier-csv` replaces the
+stale Side-2 verifier column with post-fix measurements (see
+`patch_side2_verify`) and should be passed whenever a verifier row is rendered.
+
 Usage:
-    python scripts/plot_amortization.py results.csv
-    python scripts/plot_amortization.py results.csv --out fig.pdf
-    python scripts/plot_amortization.py results.csv --n 16
+    python scripts/plot_amortization.py results/results.csv
+    python scripts/plot_amortization.py results/results.csv --out fig.pdf
+    python scripts/plot_amortization.py results/results.csv --n 16
+    python scripts/plot_amortization.py results/results.csv --side prover \\
+        --out amortization_prover.pdf
+    python scripts/plot_amortization.py results/results.csv --side verifier \\
+        --verifier-csv results/results_verifier.csv --out amortization_verifier.pdf
 """
 
 import argparse
@@ -52,15 +60,61 @@ def plot_panel(ax, pivot, title, ylabel, side1_label, side2_label):
         )
 
 
+def patch_side2_verify(df, path):
+    """Replace the Side-2 `verify_ms` column with post-fix measurements.
+
+    `results/results.csv`'s Side-2 verifier timings predate the square-and-multiply fix
+    in `rok_pcc::evaluate_constraint` and overstate the verifier by up to ~14×
+    at n = 2^18. `results/results_verifier.csv` measures the same four stages after the
+    fix, so summing them reproduces exactly what `bench_csv` puts in
+    `verify_ms` for Side 2 (statement prep is not part of that column).
+
+    Side 1 is left alone: one lincheck verify never touched the naive
+    exponentiation, so those numbers were always correct.
+    """
+    vdf = pd.read_csv(path)
+    needed = {"n", "k", "v_fold_ms", "v_discharge_ms", "v_rokp_ms", "v_lincheck_ms"}
+    missing = needed - set(vdf.columns)
+    if missing:
+        print(f"{path} is missing columns: {missing}", file=sys.stderr)
+        sys.exit(1)
+
+    fixed = vdf[["n", "k"]].copy()
+    fixed["side"] = "side2"
+    fixed["fixed_ms"] = (vdf["v_fold_ms"] + vdf["v_discharge_ms"]
+                         + vdf["v_rokp_ms"] + vdf["v_lincheck_ms"])
+
+    out = df.merge(fixed, on=["n", "k", "side"], how="left")
+    unmatched = out["fixed_ms"].isna() & (out["side"] == "side2")
+    if unmatched.any():
+        print(f"warning: {int(unmatched.sum())} Side-2 rows had no match in "
+              f"{path} and keep their stale values", file=sys.stderr)
+    out["verify_ms"] = out["fixed_ms"].fillna(out["verify_ms"])
+    return out.drop(columns=["fixed_ms"])
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("csv", help="path to CSV produced by examples/bench_csv")
-    ap.add_argument("--out", default="amortization.pdf", help="output path")
+    ap.add_argument("--out", default="results/amortization.pdf", help="output path")
     ap.add_argument(
         "--n",
         type=int,
         default=None,
         help="restrict to a single n; default = one column per n in the CSV",
+    )
+    ap.add_argument(
+        "--side",
+        choices=("both", "prover", "verifier"),
+        default="both",
+        help="which row to render; 'prover' and 'verifier' give one file each",
+    )
+    ap.add_argument(
+        "--verifier-csv",
+        default=None,
+        help="results/results_verifier.csv, to replace the stale Side-2 verify column "
+             "(see patch_side2_verify). Strongly recommended with --side "
+             "verifier or both.",
     )
     args = ap.parse_args()
 
@@ -71,11 +125,22 @@ def main():
         print(f"CSV is missing columns: {missing}", file=sys.stderr)
         sys.exit(1)
 
+    wants_verifier = args.side in ("both", "verifier")
+    if args.verifier_csv:
+        df = patch_side2_verify(df, args.verifier_csv)
+    elif wants_verifier:
+        print("warning: rendering verifier timings straight from "
+              f"{args.csv}. Its Side-2 verify_ms predates the "
+              "rok_pcc::evaluate_constraint fix and overstates the verifier by "
+              "up to ~14x at n = 2^18. Pass --verifier-csv results/results_verifier.csv "
+              "to use post-fix measurements.", file=sys.stderr)
+
     ns = [args.n] if args.n is not None else sorted(df["n"].unique())
 
-    # Layout: rows = {prover, verifier}, cols = ns.
+    rows = ["prover", "verifier"] if args.side == "both" else [args.side]
     fig, axes = plt.subplots(
-        2, len(ns), figsize=(5 * len(ns), 8), squeeze=False, sharex="col"
+        len(rows), len(ns), figsize=(5 * len(ns), 4 * len(rows)),
+        squeeze=False, sharex="col",
     )
 
     for col, n in enumerate(ns):
@@ -91,25 +156,25 @@ def main():
         else:
             n_label = f"n = {n_int}"
 
-        pivot_prove = sub.pivot(index="k", columns="side", values="prove_ms")
-        pivot_verify = sub.pivot(index="k", columns="side", values="verify_ms")
-
-        plot_panel(
-            axes[0, col],
-            pivot_prove,
-            f"Server (Prover), {n_label}",
-            "server time (ms)",
-            side1_label="Side 1: K lincheck proofs",
-            side2_label="Side 2: amortize + 1 lincheck proof",
-        )
-        plot_panel(
-            axes[1, col],
-            pivot_verify,
-            f"Local party (Verifier), {n_label}",
-            "per-verifier time (ms)",
-            side1_label="Side 1: 1 lincheck verify",
-            side2_label="Side 2: 1 path + RokP + lincheck verify",
-        )
+        for row, which in enumerate(rows):
+            if which == "prover":
+                plot_panel(
+                    axes[row, col],
+                    sub.pivot(index="k", columns="side", values="prove_ms"),
+                    f"Server (Prover), {n_label}",
+                    "server time (ms)",
+                    side1_label="Side 1: K lincheck proofs",
+                    side2_label="Side 2: amortize + 1 lincheck proof",
+                )
+            else:
+                plot_panel(
+                    axes[row, col],
+                    sub.pivot(index="k", columns="side", values="verify_ms"),
+                    f"Local party (Verifier), {n_label}",
+                    "per-verifier time (ms)",
+                    side1_label="Side 1: 1 lincheck verify",
+                    side2_label="Side 2: 1 path + RokP + lincheck verify",
+                )
 
     fig.tight_layout()
     fig.savefig(args.out)

@@ -11,15 +11,20 @@ Server-delegation scenario. A local party with one R_{A,B,C} job either
        regardless and `y = Σ f(κ)` falls out of that table.
 
   (ii) delegates: commits to its four sparse leaf polynomials, then verifies the
-       amortized proof — fold path + promise discharge + RokP verify (the
-       amortization) plus one inner-lincheck verify on the folded R_P claim.
-       It never computes `y_A, y_B, y_C` itself; that is what it delegates.
+       amortized proof. It never computes `y_A, y_B, y_C` itself; that is what
+       it delegates. Two depths are plotted:
+         * end-to-end (1 + 2 + 3): proof of inclusion + RokP verify + one
+           inner-lincheck verify on the folded R_P claim,
+         * inclusion only (1): statement prep + fold path + promise discharge.
+       The gap between them is the fixed RokP + lincheck tail, ~7.4 ms, which
+       every party pays regardless of K.
 
 Common starting point: both sides begin the moment the verifier samples β
 (arkworks `verifier_second_round`), with the claim `t(β)` — this repo's R_P
 statement (α, β, y, η) — still to be established. Neither side is charged for
 the outer sumcheck, which is identical in both worlds. `RokP::reduce` is not in
-the baseline: plain Marlin never runs it. See docs/decisions/marlin_baseline.md.
+the baseline: plain Marlin never runs it — it exists only to reduce a *folded*
+root back to a single R_P claim.
 
 Delegating is cheaper wherever the orange curve sits below the blue rule; where
 it crosses, the crossing K is marked.
@@ -28,8 +33,8 @@ it crosses, the crossing K is marked.
 just evaluate P_A, P_B, P_C at (α, β) itself, if it has nobody to convince.
 
 Usage:
-    python scripts/plot_delegation_gain.py results_verifier.csv
-    python scripts/plot_delegation_gain.py results_verifier.csv --reference
+    python scripts/plot_delegation_gain.py results/results_verifier.csv
+    python scripts/plot_delegation_gain.py results/results_verifier.csv --reference
 """
 
 import argparse
@@ -38,8 +43,8 @@ import sys
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# Categorical slots 1-2.
-C_LOCAL, C_DELEG = "#2a78d6", "#eb6834"
+# Categorical slots 1-3.
+C_LOCAL, C_DELEG, C_INCL = "#2a78d6", "#eb6834", "#1baf7a"
 INK, INK_MUTED = "#0b0b0b", "#52514e"
 
 
@@ -61,7 +66,7 @@ def style(ax):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("csv", help="CSV from examples/bench_verifier_csv")
-    ap.add_argument("--out", default="delegation_gain.pdf")
+    ap.add_argument("--out", default="results/delegation_gain.pdf")
     ap.add_argument("--reference", action="store_true",
                     help="also draw the no-proof floor (direct evaluation)")
     args = ap.parse_args()
@@ -76,9 +81,12 @@ def main():
 
     df = df.copy()
     # Recomputed from the stages rather than read from v_total_ms, so the plot
-    # stays correct if the grouping is ever redrawn.
-    df["client_ms"] = (df["v_stmt_prep_ms"] + df["v_fold_ms"]
-                       + df["v_discharge_ms"] + df["v_rokp_ms"]
+    # stays correct if the grouping is ever redrawn. Part 1 (proof of inclusion)
+    # carries statement prep: it is what you must do to have something to be
+    # included, and at ~1 ms it is 4% of the part either way.
+    df["inclusion_ms"] = (df["v_stmt_prep_ms"] + df["v_fold_ms"]
+                          + df["v_discharge_ms"])
+    df["client_ms"] = (df["inclusion_ms"] + df["v_rokp_ms"]
                        + df["v_lincheck_ms"])
     df["gain"] = df["p_local_lincheck_ms"] / df["client_ms"]
 
@@ -102,15 +110,15 @@ def main():
                        linewidth=1.0, linestyle="-.",
                        label="evaluate it yourself (no proof)")
         ax.plot(sub["k"], sub["client_ms"], "o-", color=C_DELEG,
-                linewidth=2, markersize=5, label="delegate + amortize (client)")
+                linewidth=2, markersize=5,
+                label="delegate: verify $(a) + (b) + (c)$ (end-to-end)")
+        ax.plot(sub["k"], sub["inclusion_ms"], "s--", color=C_INCL,
+                linewidth=1.8, markersize=5,
+                label="delegate: verify $(a)$ (proof of inclusion)")
         if col == len(ns) - 1:
             ax.annotate("prove locally", (sub["k"].iloc[0], local),
                         textcoords="offset points", xytext=(2, 5),
                         fontsize=8, color=C_LOCAL)
-            last = sub.iloc[-1]
-            ax.annotate("delegate", (last["k"], last["client_ms"]),
-                        textcoords="offset points", xytext=(0, -14),
-                        fontsize=8, color=C_DELEG, ha="right")
         ax.set_xscale("log", base=2)
         ax.set_yscale("log")
         ax.set_xlabel("$K$")

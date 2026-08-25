@@ -180,10 +180,12 @@ src/
 ├── reductions/           ── amortization contribution ──
 ├── relations/            the relation zoo + fold promises
 │
-├── marlin_ahp/           ── vendored Marlin discharge (backend / baseline) ──
+├── marlin_ahp/           ── vendored Marlin (backend / baseline) ──
 │   ├── arithmetize.rs    index A,B,C over shared domain K
 │   ├── bivariate.rs      unnormalized bivariate Lagrange poly u_H(X,Y)
-│   └── inner_lincheck.rs Marlin inner sumcheck — discharges R_P
+│   ├── r1cs.rs           satisfiable instance for the outer sumcheck
+│   ├── outer_sumcheck.rs Marlin rounds 1-2 — the witness-dependent half
+│   └── inner_lincheck.rs Marlin inner sumcheck (round 3) — discharges R_P
 │
 ├── pc/                   ── infrastructure ──
 ├── transcript.rs         KZG · Blake3 Fiat–Shamir · binary Merkle tree
@@ -193,14 +195,30 @@ src/
 benches/marlin_lincheck.rs   Criterion bench: prover-side Side 1 vs Side 2
 examples/bench_csv.rs        Full pipeline (prover + verifier), CSV output
 examples/bench_verifier_csv.rs  Verifier stages + delegation baselines, CSV output
+examples/bench_marlin_split.rs  Full Marlin prover, split WD / WI, CSV output
 scripts/plot_amortization.py    Plots a results CSV (prover + verifier panels)
-scripts/plot_verifier_amortization.py  Amortization-only verifier cost
+scripts/plot_verifier_amortization.py  Proof-of-inclusion verifier cost
 scripts/plot_delegation_gain.py        Prove-it-yourself vs. delegate-and-verify
-results.csv                  Checked-in sweep, n = 2^10…2^18, K = 1…128
-results_verifier.csv         Verifier-side sweep, same grid
-amortization.png/.pdf        The plot of that sweep
-verifier_amortization.png/.pdf  Amortization-only verifier cost
-delegation_gain.png/.pdf        Delegation gain for the local party
+scripts/plot_verifier_aggregate.py     K linchecks vs. one amortized proof
+scripts/plot_marlin_split.py           Witness-dependent vs. -independent Marlin
+scripts/plot_marlin_density.py         The same split vs. matrix density
+scripts/plot_delegation_full_marlin.py Delegating inside a whole Marlin proof
+results/                     ── every CSV and figure lands here ──
+├── results.csv              Checked-in sweep, n = 2^10…2^18, K = 1…128
+├── results_verifier.csv     Verifier-side sweep, same grid
+├── results_marlin_split.csv Full-Marlin prover split over n, both ZK settings
+├── results_marlin_density.csv  Full-Marlin prover split over matrix density
+│
+├── amortization.*           Side 1 vs Side 2, prover and verifier rows
+├── amortization_prover.*    Prover row alone
+├── amortization_verifier.*  Verifier row alone
+├── verifier_amortization.*  Proof-of-inclusion verifier cost (part 1)
+├── delegation_gain.*        Delegation gain for the local party
+├── verifier_aggregate.*     Aggregate verification work vs. K linchecks
+├── marlin_split.*           Witness-dependent vs. -independent prover split
+├── marlin_density.*         The same split vs. matrix density
+└── delegation_full_marlin.* Delegating inside a whole Marlin proof
+                             (each figure is written as both .pdf and .png)
 ```
 
 ---
@@ -223,7 +241,7 @@ Full `(n, K)` sweep with prover **and** verifier timings, as CSV:
 
 ```bash
 cargo run --release --example bench_csv -- \
-    --ns 8,16,32 --ks 1,2,4,8,16,32 --reps 5 --out results.csv
+    --ns 8,16,32 --ks 1,2,4,8,16,32 --reps 5 --out results/results.csv
 ```
 
 Defaults: `--ns 8,16 --ks 1,2,4,8,16 --reps 5`, output to stdout. Columns are
@@ -232,8 +250,20 @@ Defaults: `--ns 8,16 --ks 1,2,4,8,16 --reps 5`, output to stdout. Columns are
 Plotting the sweep (needs `pandas` + `matplotlib`):
 
 ```bash
-python scripts/plot_amortization.py results.csv --out amortization.pdf
+python scripts/plot_amortization.py results/results.csv \
+    --verifier-csv results/results_verifier.csv --out results/amortization.pdf
+
+# or as two files, one row each
+python scripts/plot_amortization.py results/results.csv --side prover \
+    --out results/amortization_prover.pdf
+python scripts/plot_amortization.py results/results.csv --side verifier \
+    --verifier-csv results/results_verifier.csv --out results/amortization_verifier.pdf
 ```
+
+`--verifier-csv` swaps the stale Side-2 `verify_ms` column for the post-fix
+measurements in `results/results_verifier.csv` (Side 1 is untouched — one lincheck
+verify never ran the naive exponentiation). Without it the script warns and
+plots the pre-fix numbers.
 
 Verifier-side sweep — the same grid, but the Side-2 prover runs **once** per
 `(n, K)` and only the local party's verification is re-timed, split into its
@@ -243,12 +273,14 @@ sweep is not needed:
 ```bash
 cargo run --release --example bench_verifier_csv -- \
     --ns 1024,4096,16384,65536,262144 --ks 1,2,4,8,16,32,64,128 \
-    --reps 9 --out results_verifier.csv
+    --reps 9 --out results/results_verifier.csv
 
-python scripts/plot_verifier_amortization.py results_verifier.csv \
-    --out verifier_amortization.pdf
-python scripts/plot_delegation_gain.py results_verifier.csv \
-    --out delegation_gain.pdf
+python scripts/plot_verifier_amortization.py results/results_verifier.csv \
+    --out results/verifier_amortization.pdf
+python scripts/plot_delegation_gain.py results/results_verifier.csv \
+    --out results/delegation_gain.pdf
+python scripts/plot_verifier_aggregate.py results/results_verifier.csv \
+    --out results/verifier_aggregate.pdf
 ```
 
 Columns are `n,k` then the local party's stages (`v_stmt_prep_ms`, `v_fold_ms`,
@@ -256,18 +288,56 @@ Columns are `n,k` then the local party's stages (`v_stmt_prep_ms`, `v_fold_ms`,
 `v_total_ms`), then the no-delegation baselines (`p_local_rokp_ms`,
 `p_local_lincheck_ms`) and the no-proof reference `ref_direct_eval_ms`.
 
+Full-Marlin prover split — how much of a whole proof is witness-dependent (and
+therefore *not* delegatable) versus witness-independent:
+
+```bash
+cargo run --release --example bench_marlin_split -- \
+    --ns 1024,4096,16384,65536,262144 --densities 2 --reps 3 --zk both \
+    --out results/results_marlin_split.csv
+
+python scripts/plot_marlin_split.py results/results_marlin_split.csv \
+    --out results/marlin_split.pdf
+python scripts/plot_delegation_full_marlin.py \
+    results/results_marlin_split.csv results/results_verifier.csv \
+    --out results/delegation_full_marlin.pdf
+```
+
+Sweeping matrix density instead of `n` — `--densities d` puts `d·n` non-zeros
+across `(A, B, C)` jointly:
+
+```bash
+cargo run --release --example bench_marlin_split -- \
+    --ns 4096,16384,65536 --densities 2,3,4,5,6,8 --reps 5 --zk both \
+    --out results/results_marlin_density.csv
+
+python scripts/plot_marlin_density.py results/results_marlin_density.csv \
+    --n 16384 --out results/marlin_density.pdf
+```
+
+Use `--reps 3` or more: `median` takes `xs[len/2]`, which at `reps = 2` returns
+the larger sample rather than a median.
+
+This one sizes the SRS at `D = 4n`, not the `D = 2n` the other benchmarks use:
+with zero-knowledge on, Marlin's mask polynomial has degree `3n − 1` and must be
+committable, and running both ZK settings at one `D` keeps the ZK comparison
+from being confounded with SRS size. Consequently its `round3_ms` is **not**
+comparable with `p_local_lincheck_ms` — the `g_2` degree shift and the batched
+opening both scale with `D` — so any ratio against `wd_ms` must use this file's
+own `round3_ms`.
+
 ---
 
 ## Results
 
-The checked-in [`results.csv`](results.csv) is the sweep behind
-[`amortization.png`](amortization.png), covering `n = 2^10 … 2^18` and
+The checked-in [`results/results.csv`](results/results.csv) is the sweep behind
+[`results/amortization.png`](results/amortization.png), covering `n = 2^10 … 2^18` and
 `K = 1 … 128` at 5 reps. Reproduce it with:
 
 ```bash
 cargo run --release --example bench_csv -- \
     --ns 1024,4096,16384,65536,262144 --ks 1,2,4,8,16,32,64,128 \
-    --reps 5 --out results.csv
+    --reps 5 --out results/results.csv
 ```
 
 The headline number is the crossover `K*` — the smallest batch size at which the
@@ -290,38 +360,40 @@ already too cheap to be worth folding.
 The trade is on the verifier: Side-1 verification is essentially flat in both
 `n` and `K` (~4 ms, one lincheck), while Side-2 costs a fold path + `RokP` +
 lincheck and grows with `log K` — 8.4 ms at `K = 1` up to 33.6 ms at `K = 128`
-(measured at `n = 2^18`, from [`results_verifier.csv`](results_verifier.csv)).
+(measured at `n = 2^18`, from [`results/results_verifier.csv`](results/results_verifier.csv)).
 
-> **Note.** The `verify_ms` column of [`results.csv`](results.csv), and the
-> verifier panel of `amortization.png`, predate the square-and-multiply fix in
-> `rok_pcc::evaluate_constraint` and overstate the Side-2 verifier by up to
-> ~14× at `n = 2^18`. The `prove_ms` column is unaffected — the naive
-> exponentiation was only ever on the verifier's path. Re-run `bench_csv` to
-> refresh them, or read the verifier costs off `results_verifier.csv`, which
-> was measured after the fix.
+> **Note.** The Side-2 `verify_ms` column of [`results/results.csv`](results/results.csv)
+> predates the square-and-multiply fix in `rok_pcc::evaluate_constraint` and
+> overstates the verifier by up to ~14× at `n = 2^18`. The `prove_ms` column is
+> unaffected — the naive exponentiation was only ever on the verifier's path,
+> and Side 1's verifier never ran it either. The plots work around this with
+> `--verifier-csv results/results_verifier.csv`, which substitutes post-fix
+> measurements of the same four stages; re-run `bench_csv` if you want the CSV
+> itself refreshed.
 
 ### Verifier-side amortization cost
 
-Splitting the local party's work at the point where the pipeline stops being
-SNARK-agnostic — everything up to and including `RokP::verify` reads only the
-SRS and `n`, never the matrices or the lincheck index:
+The local party's verification splits into three parts:
 
-| stage | `n = 2^10` | `n = 2^18` | scales with |
-|-------|-----------:|-----------:|-------------|
-| statement prep (4 sparse commitments) | 0.92 ms | 1.04 ms | — |
-| fold path verify                      | 0.66 ms | 0.66 ms | `log K` |
-| promise discharge                     | 24.8 ms | 24.5 ms | `log K` |
-| `RokP` verify                         | 4.16 ms | 4.15 ms | — |
-| **amortization subtotal**             | **30.6 ms** | **30.3 ms** | `log K` |
-| inner-lincheck verify                 | 3.21 ms | 3.24 ms | — |
+| part | stage | `n = 2^10` | `n = 2^18` | scales with |
+|------|-------|-----------:|-----------:|-------------|
+| **1** | statement prep (4 sparse commitments) | 0.92 ms | 1.04 ms | — |
+| **1** | fold path verify                      | 0.66 ms | 0.66 ms | `log K` |
+| **1** | promise discharge                     | 24.8 ms | 24.5 ms | `log K` |
+|       | **proof of inclusion — subtotal**     | **26.4 ms** | **26.2 ms** | `log K` |
+| **2** | `RokP` verify                         | 4.16 ms | 4.15 ms | — |
+| **3** | inner-lincheck verify                 | 3.21 ms | 3.24 ms | — |
 
-(at `K = 128`; see [`verifier_amortization.png`](verifier_amortization.png))
+(at `K = 128`; [`results/verifier_amortization.png`](results/verifier_amortization.png) plots
+part 1, which is the term amortization adds per participating party — pass
+`--with-rokp` to fold part 2 back in.)
 
-The amortization cost is independent of `n` — the five `n` curves agree to 7%
-— and grows only with `log K`, at roughly 2.9 ms per doubling, essentially all
-of it in the promise discharge. Statement preparation is the client's own
-share: committing to its four sparse leaf polynomials. It is *not* charged the
-`O(n)` evaluation of `y_A, y_B, y_C` — that is the answer it is delegating.
+Parts 2 and 3 are a fixed 7.4 ms tail, flat in both `n` and `K`. Part 1 is
+independent of `n` too — the five curves agree to 10% for `K ≥ 2` — and grows
+only with `log K`, at roughly 2.9 ms per doubling, essentially all of it in the
+promise discharge. Statement preparation is the client's own share: committing
+to its four sparse leaf polynomials. It is *not* charged the `O(n)` evaluation
+of `y_A, y_B, y_C` — that is the answer it is delegating.
 
 ### Is delegating worth it for the local party?
 
@@ -330,9 +402,7 @@ and the claim `t(β)` — this repo's `R_P` statement `(α, β, y, η)` — is s
 be established. The baseline is the **Marlin inner sumcheck**, which
 `marlin_ahp/inner_lincheck.rs` reimplements from arkworks-rs/marlin's
 `prover_third_round`; `RokP::reduce` is deliberately *not* in it, since plain
-Marlin never runs it. See
-[`docs/decisions/marlin_baseline.md`](docs/decisions/marlin_baseline.md) for the
-correspondence and the reasoning ([`delegation_gain.png`](delegation_gain.png)):
+Marlin never runs it ([`results/delegation_gain.png`](results/delegation_gain.png)):
 
 | `n`    | Marlin inner sumcheck | delegate + verify (`K = 128`) | gain | break-even |
 |--------|----------------------:|------------------------------:|-----:|-----------:|
@@ -353,6 +423,116 @@ verifier pays statement preparation alone — 1.04 ms, a 3900× reduction — an
 ~30 ms lands on the end verifier instead. That is the additive `O(log K)`
 verifier overhead, i.e. a transfer of cost rather than a saving.
 
+The figure splits the delegated cost in two, so the amortization-specific part
+is separable from the fixed tail:
+
+| part | at `n = 2^18`, `K = 128` |
+|------|-------------------------:|
+| **1** proof of inclusion — statement prep + fold path + promise discharge | 26.18 ms |
+| **2** `RokP` verify | 4.15 ms |
+| **3** folded lincheck verify | 3.24 ms |
+
+Parts 2 and 3 are a fixed 7.4 ms tail, flat in both `n` and `K`; all of the
+growth is in part 1's promise discharge.
+
+### What amortization costs the verifying side
+
+[`results/verifier_aggregate.png`](results/verifier_aggregate.png) is the same ledger read
+across all `K` jobs at once: `K` independent lincheck verifies against `K`
+proofs of inclusion plus a single `RokP` and a single folded lincheck (the
+aggregate reading, where one auditor checks everything).
+
+Amortization **loses** here, by 2.6× at `K = 1` rising to 8.1× at `K = 128`
+(`n = 2^18`: 415 ms → 3358 ms). This is not a defect — it is the additive
+`O(log K)` verifier overhead the construction trades for the Server's `O(K·s) →
+O(K·log K + s)` saving, made explicit. One proof of inclusion costs 26.2 ms
+against 3.2 ms for a plain lincheck verify, and that per-job ratio itself grows
+with `log K`, so the gap widens slowly rather than converging.
+
+In the true multi-verifier setting the `K` verifiers cannot communicate, so each
+checks parts 2 and 3 for itself and the amortized total is `K · 33.6 ms` —
+strictly worse again. The plotted reading is the generous one.
+
+### How much of Marlin can be delegated at all
+
+Everything above measures the inner sumcheck in isolation. Put it back in the
+context of a whole proof ([`results/marlin_split.png`](results/marlin_split.png)): only the
+witness-*independent* part is a claim about the public matrices, so only it can
+be handed to a Server. From [`results/results_marlin_split.csv`](results/results_marlin_split.csv):
+
+| `n`    | witness-dependent | witness-independent | ceiling |
+|--------|------------------:|--------------------:|--------:|
+| `2^10` | 58.7% / 62.5%     | 41.3% / 37.5%       | 1.70× / 1.60× |
+| `2^12` | 55.8% / 60.6%     | 44.2% / 39.4%       | 1.79× / 1.65× |
+| `2^14` | 54.5% / 61.6%     | 45.5% / 38.4%       | 1.83× / 1.62× |
+| `2^16` | 54.3% / 60.1%     | 45.7% / 39.9%       | 1.84× / 1.66× |
+| `2^18` | 54.8% / 61.4%     | 45.2% / 38.6%       | 1.82× / 1.63× |
+
+(`no ZK / ZK`. Witness-independent counts round 3 **plus** `t(X)`, which sits
+inside round 2 but depends only on `α` and the matrices — about 1% of the
+prover. Zero-knowledge work is entirely witness-dependent, so it shrinks the
+delegatable share by ~6 points.)
+
+So the whole-proof speedup is capped at `(WD + WI)/WD ≈ 1.6–1.8×` no matter how
+cheap verification becomes. [`results/delegation_full_marlin.png`](results/delegation_full_marlin.png)
+plots the approach to that ceiling: at `n = 2^18` delegation reaches **1.81×**
+against a ceiling of 1.82× — verification (33.6 ms) is negligible beside a 6.3 s
+witness-dependent half — while at `n = 2^10` it decays from 1.55× to 1.20× as
+`K` grows, because there the `log K` verification overhead is no longer small.
+
+> The 121× in `results/delegation_gain.png` and the 1.8× here are not in conflict: the
+> first is the speedup on the *inner sumcheck alone*, the second is what that
+> becomes once the undelegatable half of the prover is included. The second is
+> the number to quote for a full Marlin proof.
+
+The `D = 4n` SRS this benchmark needs (for the ZK mask, degree `3n − 1`) does
+**not** distort the split: both rounds carry one degree-`D` shifted commitment
+and one degree-`D` batched opening, so the inflation is near-symmetric and
+cancels in the ratio. Re-measuring at `D = 2n` (`--srs-mult 2 --zk off`) moves
+the witness-independent share by ~1 point (42.7% vs 44.2% at `n = 2^12`; 44.9%
+vs 45.5% at `n = 2^14`), and reproduces `p_local_lincheck_ms` to within 6–9%.
+
+### Denser matrices are better for delegation
+
+The split above is for `2n` non-zeros, the sparsest R1CS this harness builds.
+Real circuits run denser. Sweeping `--densities` shows why it matters
+([`results/marlin_density.png`](results/marlin_density.png), at `n = 2^14`):
+
+| non-zeros | `\|K\|` | delegatable share | ceiling |
+|-----------|--------:|------------------:|--------:|
+| `2n`      | `2n`    | 44.9% / 41.0%     | 1.81× / 1.69× |
+| `3n`      | `4n`    | 54.0% / 49.6%     | 2.18× / 1.99× |
+| `4n`      | `4n`    | 54.3% / 49.8%     | 2.19× / 2.00× |
+| `5n`      | `8n`    | 65.0% / 60.7%     | 2.86× / 2.55× |
+| `6n`      | `8n`    | 65.3% / 61.2%     | 2.88× / 2.58× |
+| `8n`      | `8n`    | 65.1% / 61.0%     | 2.86× / 2.56× |
+
+(`no ZK / ZK`.) The witness-dependent half is FFTs and commitments over
+`H`-sized polynomials and barely notices density — only the `Az`/`Bz` products
+(0.6% of round 1 at `2n`, 2.5% at `8n`) and `t(X)` scale with it. The
+witness-independent half is round 3 over `|K|`, which doubles with it. So
+**the delegatable share climbs from ~45% to ~65% and the ceiling from 1.8× to
+2.9×** as matrices densify.
+
+The share is a **step function of `|K| = next_pow2(d·n)`, not of `d`**: `3n` and
+`4n` are indistinguishable, as are `5n`, `6n` and `8n`. The plateaus are exactly
+where the padding puts them, which is a useful sanity check on the measurement.
+
+Practical reading: `2n` is the pessimistic corner of the parameter space. A
+hand-written circuit at 3–5 non-zeros per constraint sits in the 54–65% band,
+where delegating the witness-independent half is worth 2.2–2.9× rather than
+1.8×.
+
+> **Measurement caveat.** Absolute times in
+> [`results/results_marlin_density.csv`](results/results_marlin_density.csv) and
+> [`results/results_marlin_split.csv`](results/results_marlin_split.csv) drift by up to ~1.8×
+> between blocks minutes apart — machine frequency state, not the code. At
+> `n = 2^16`, `d = 3` and `d = 4` differ 1.87× in absolute time (8390 ms vs
+> 4487 ms) yet give shares of 55.8% and 55.1%. Rounds 1-3 are measured
+> milliseconds apart within one block, so the drift scales them uniformly and
+> cancels in any within-row ratio. **Every figure and table above uses within-row
+> ratios and is unaffected; do not compare absolute ms across rows.**
+
 The local party's delegated cost is flat in `n`, so the gain is set entirely by
 how expensive the local prove is. At `n = 2^10` the lincheck is already cheap
 enough that the amortization overhead overtakes it at `K = 32`; from `n = 2^12`
@@ -371,6 +551,17 @@ for it.
   where different discharging SNARKs plug in (see `relations/p.rs`).
 - SRS is sized for the largest `(n, K)` in a run; sizing logic and the
   degree-growth argument are documented in `examples/bench_csv.rs`.
+- **Marlin's outer and inner sumchecks here use different α-normalizations.**
+  Upstream weights `t` by the unnormalized `u_H(α, h_i)`, which is what keeps
+  its verifier succinct; this crate's `R_P` uses `λ_i(α)` on both sides, because
+  `P_M(α,β) = Σ M[i,j]λ_i(α)λ_j(β)` is the bivariate evaluation the delegation
+  construction is about. The two are different functionals — `u_H(α,h_i) =
+  |H|·λ_i(α)/h_i` is a per-`i` factor — so `outer_sumcheck` and
+  `inner_lincheck` are each correct under their own convention but do **not**
+  compose into one end-to-end verifiable proof. Costs are unaffected (identical
+  `|K|`, degrees and operations), so the split measurements stand;
+  `outer_sumcheck::repo_p_statement` converts at the seam. Full reasoning in
+  that module's docs.
 - This is research/thesis code: correctness and legibility over production
   hardening.
 
@@ -415,3 +606,6 @@ dual licensed as above, without any additional terms or conditions.
 
 *Crate: `amortized-proofs-masters-thesis` · research code accompanying
 [ePrint 2026/1553](https://eprint.iacr.org/2026/1553).*
+
+
+
