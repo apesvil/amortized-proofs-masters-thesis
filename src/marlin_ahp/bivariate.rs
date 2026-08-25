@@ -1,5 +1,5 @@
 // Vendored from `arkworks-rs/marlin` `src/ahp/mod.rs` (MIT/Apache-2.0).
-// Trimmed and re-typed for our Fr; adapted to arkworks 0.4.
+// Trimmed and re-typed for our Fr; adapted to arkworks 0.5.
 //
 // The "unnormalized bivariate Lagrange polynomial" is
 //   u_H(X, Y) = (v_H(X) − v_H(Y)) / (X − Y)
@@ -17,7 +17,13 @@ pub trait UnnormalizedBivariateLagrangePoly {
 
     /// Batch evaluate `u_H(x, h_i)` for every `h_i ∈ H`, given a fixed `x`.
     /// Caller is responsible for `x ∉ H` (otherwise a denominator is zero).
-    fn batch_eval_unnormalized_bivariate_lagrange_poly_with_same_inputs(&self, x: Fr) -> Vec<Fr>;
+    ///
+    /// Named after upstream's `..._with_diff_inputs`, which is what this
+    /// computes: the two arguments of `u_H` differ. (Upstream's
+    /// `..._with_same_inputs` is the diagonal `u_H(h, h)` and takes no point;
+    /// we never need it — `arithmetize.rs` inlines its closed form as
+    /// `M[i,j]·h_i·h_j/|H|²`.)
+    fn batch_eval_unnormalized_bivariate_lagrange_poly_with_diff_inputs(&self, x: Fr) -> Vec<Fr>;
 }
 
 impl UnnormalizedBivariateLagrangePoly for Radix2EvaluationDomain<Fr> {
@@ -33,7 +39,7 @@ impl UnnormalizedBivariateLagrangePoly for Radix2EvaluationDomain<Fr> {
         }
     }
 
-    fn batch_eval_unnormalized_bivariate_lagrange_poly_with_same_inputs(&self, x: Fr) -> Vec<Fr> {
+    fn batch_eval_unnormalized_bivariate_lagrange_poly_with_diff_inputs(&self, x: Fr) -> Vec<Fr> {
         let v_h_x = self.evaluate_vanishing_polynomial(x);
         let elements: Vec<Fr> = self.elements().collect();
         let mut denoms: Vec<Fr> = elements.iter().map(|&h| x - h).collect();
@@ -58,7 +64,7 @@ mod tests {
 
         let n_fr = Fr::from(n as u64);
         let elems: Vec<Fr> = dom.elements().collect();
-        let us = dom.batch_eval_unnormalized_bivariate_lagrange_poly_with_same_inputs(alpha);
+        let us = dom.batch_eval_unnormalized_bivariate_lagrange_poly_with_diff_inputs(alpha);
         let lagrange = dom.evaluate_all_lagrange_coefficients(alpha);
 
         for (i, &h_i) in elems.iter().enumerate() {
