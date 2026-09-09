@@ -16,7 +16,7 @@ use super::rok_pcc::{absorb_pcc_d_statement, evaluate_constraint};
 /// to the composed `R_PCC --Π_DT--> R_PCC-D --Π_PC--> R_PCO` chain.
 ///
 /// **Input shape.** Per leaf, a *bundle* of inner `R_PCC` statements
-/// (`Vec<PccStatement>`): when `MFold` feeds this protocol, each leaf
+/// (`Vec<PccStatement>`): when `ABCFold` feeds this protocol, each leaf
 /// carries the `κ` `R_PCC` promises gathered along its fold path. The
 /// protocol treats the bundle as `R_PCC^κ_inner` — semantically the
 /// Cartesian product — without ever concatenating into a single `R_PCC`.

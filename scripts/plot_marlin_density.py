@@ -61,6 +61,8 @@ def main():
     ap.add_argument("--out", default="results/marlin_density.pdf")
     ap.add_argument("--n", type=int, default=None,
                     help="n for the composition panel (default: largest)")
+    ap.add_argument("--panels", choices=("both", "composition"), default="both",
+                    help="'composition' emits panel (a) alone, for embedding")
     args = ap.parse_args()
 
     df = pd.read_csv(args.csv)
@@ -83,7 +85,11 @@ def main():
     ns = sorted(df["n"].unique())
     n_star = args.n if args.n is not None else ns[-1]
 
-    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.4))
+    solo = args.panels == "composition"
+    fig, axes = plt.subplots(1, 1 if solo else 2,
+                             figsize=(6.0, 4.4) if solo else (11.5, 4.4),
+                             squeeze=False)
+    axes = axes[0]
 
     # -- (a) composition vs density, one n, paired by ZK setting -------------
     #    Stacked, and therefore linear: stacking on a log axis would break
@@ -118,11 +124,18 @@ def main():
     ax.set_ylabel("share of prover time (%)")
     ax.set_ylim(0, 112)
     ax.set_yticks([0, 20, 40, 60, 80, 100])
-    ax.set_title(f"(a) Composition, {n_label(n_star)}",
+    # No panel letter when it stands alone.
+    ax.set_title(f"{'' if solo else '(a) '}Composition, {n_label(n_star)}",
                  fontsize=10, color=INK, loc="left")
     ax.legend(fontsize=8, frameon=False, loc="lower center",
               bbox_to_anchor=(0.5, 1.10), ncol=2)
     style(ax)
+
+    if solo:
+        fig.tight_layout()
+        fig.savefig(args.out)
+        print(f"wrote {args.out}")
+        return
 
     # -- (b) delegatable share vs density, all n -----------------------------
     ax = axes[1]

@@ -1,7 +1,7 @@
 use ark_bls12_381::Fr;
 
-/// Public statement of R_P (page 27 of the updated paper, extended to the
-/// three-matrix R1CS setting). The implicit claim is
+/// Public statement of R_P extended to the
+/// three-matrix R1CS setting. The implicit claim is
 /// ```text
 ///   y = P_A(α, β) + η·P_B(α, β) + η²·P_C(α, β)
 /// ```

@@ -217,8 +217,13 @@ results/                     ── every CSV and figure lands here ──
 ├── verifier_aggregate.*     Aggregate verification work vs. K linchecks
 ├── marlin_split.*           Witness-dependent vs. -independent prover split
 ├── marlin_density.*         The same split vs. matrix density
-└── delegation_full_marlin.* Delegating inside a whole Marlin proof
-                             (each figure is written as both .pdf and .png)
+├── delegation_full_marlin.* Delegating inside a whole Marlin proof
+│                            (each figure is written as both .pdf and .png)
+└── thesis/                  ── trimmed variants for embedding in the text ──
+    ├── amortization_prover_thesis.*    n ∈ {2^10, 2^14, 2^18} only
+    ├── amortization_verifier_thesis.*  n ∈ {2^10, 2^14, 2^18} only
+    ├── marlin_split_thesis.*           composition panel alone
+    └── marlin_density_thesis.*         composition panel alone
 ```
 
 ---
@@ -313,6 +318,21 @@ cargo run --release --example bench_marlin_split -- \
 
 python scripts/plot_marlin_density.py results/results_marlin_density.csv \
     --n 16384 --out results/marlin_density.pdf
+```
+
+Trimmed variants for embedding in the thesis text — `--n` takes a subset of the
+sweep, `--panels composition` emits the left panel alone:
+
+```bash
+python scripts/plot_amortization.py results/results.csv --side prover \
+    --n 1024,16384,262144 --out results/thesis/amortization_prover_thesis.pdf
+python scripts/plot_amortization.py results/results.csv --side verifier \
+    --verifier-csv results/results_verifier.csv --n 1024,16384,262144 \
+    --out results/thesis/amortization_verifier_thesis.pdf
+python scripts/plot_marlin_split.py results/results_marlin_split.csv \
+    --panels composition --out results/thesis/marlin_split_thesis.pdf
+python scripts/plot_marlin_density.py results/results_marlin_density.csv \
+    --n 16384 --panels composition --out results/thesis/marlin_density_thesis.pdf
 ```
 
 Use `--reps 3` or more: `median` takes `xs[len/2]`, which at `reps = 2` returns

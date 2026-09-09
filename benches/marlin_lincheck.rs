@@ -1,9 +1,5 @@
 //! Benchmark: amortization vs. independent inner-linchecks.
 //!
-//! Per the design discussion in `docs/decisions/shared_srs.md` and the
-//! conversation in 2026-06: the "K outer sumchecks" cost cancels between
-//! the two sides, so the differential cost is
-//!
 //!   Side 1 (no amortization): K · T_lincheck(n)
 //!   Side 2 (with amortization): T_amortize(n, K) + 1 · T_lincheck(n)
 //!

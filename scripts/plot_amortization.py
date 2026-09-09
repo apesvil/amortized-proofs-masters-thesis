@@ -99,9 +99,9 @@ def main():
     ap.add_argument("--out", default="results/amortization.pdf", help="output path")
     ap.add_argument(
         "--n",
-        type=int,
         default=None,
-        help="restrict to a single n; default = one column per n in the CSV",
+        help="comma-separated n values to keep, e.g. 1024,16384,262144; "
+             "default = one column per n in the CSV",
     )
     ap.add_argument(
         "--side",
@@ -135,7 +135,13 @@ def main():
               "up to ~14x at n = 2^18. Pass --verifier-csv results/results_verifier.csv "
               "to use post-fix measurements.", file=sys.stderr)
 
-    ns = [args.n] if args.n is not None else sorted(df["n"].unique())
+    if args.n is not None:
+        ns = [int(x) for x in args.n.split(",")]
+        unknown = [n for n in ns if n not in set(df["n"])]
+        if unknown:
+            print(f"warning: no data for n = {unknown}", file=sys.stderr)
+    else:
+        ns = sorted(df["n"].unique())
 
     rows = ["prover", "verifier"] if args.side == "both" else [args.side]
     fig, axes = plt.subplots(

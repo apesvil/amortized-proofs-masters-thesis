@@ -60,6 +60,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("csv", help="CSV from examples/bench_marlin_split")
     ap.add_argument("--out", default="results/marlin_split.pdf")
+    ap.add_argument("--panels", choices=("both", "composition"), default="both",
+                    help="'composition' emits panel (a) alone, for embedding")
     args = ap.parse_args()
 
     df = pd.read_csv(args.csv)
@@ -79,7 +81,11 @@ def main():
     ns = sorted(df["n"].unique())
     zks = sorted(df["zk"].unique())
 
-    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.6))
+    solo = args.panels == "composition"
+    fig, axes = plt.subplots(1, 1 if solo else 2,
+                             figsize=(6.0, 4.6) if solo else (11.5, 4.6),
+                             squeeze=False)
+    axes = axes[0]
 
     # -- (a) composition: stacked, and therefore linear. Stacking on a log axis
     #    would break additivity — segment lengths would stop summing to the bar.
@@ -105,14 +111,22 @@ def main():
                         ha="center", fontsize=7, color=INK_MUTED)
     ax.set_xticks(xs)
     ax.set_xticklabels([n_label(n) for n in ns])
-    ax.set_xlabel("$n$ (constraints; $|K| = 2n$ non-zeros)")
+    ax.set_xlabel("$n$ (constraints; $2n$ non-zeros)")
     ax.set_ylabel("share of prover time (%)")
     ax.set_ylim(0, 112)
     ax.set_yticks([0, 20, 40, 60, 80, 100])
-    ax.set_title("(a) Composition", fontsize=10, color=INK, loc="left")
+    # No panel letter when it stands alone.
+    ax.set_title("Composition" if solo else "(a) Composition",
+                 fontsize=10, color=INK, loc="left")
     ax.legend(fontsize=8, frameon=False, loc="lower center",
               bbox_to_anchor=(0.5, 1.10), ncol=2)
     style(ax)
+
+    if solo:
+        fig.tight_layout()
+        fig.savefig(args.out)
+        print(f"wrote {args.out}")
+        return
 
     # -- (b) absolute: lines, not stacked bars, so a log axis is honest.
     ax = axes[1]
