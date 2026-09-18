@@ -204,7 +204,7 @@ scripts/plot_marlin_split.py           Witness-dependent vs. -independent Marlin
 scripts/plot_marlin_density.py         The same split vs. matrix density
 scripts/plot_delegation_full_marlin.py Delegating inside a whole Marlin proof
 results/                     ── every CSV and figure lands here ──
-├── results.csv              Checked-in sweep, n = 2^10…2^18, K = 1…128
+├── results.csv              Checked-in sweep, n = 2^10…2^20, K = 1…128
 ├── results_verifier.csv     Verifier-side sweep, same grid
 ├── results_marlin_split.csv Full-Marlin prover split over n, both ZK settings
 ├── results_marlin_density.csv  Full-Marlin prover split over matrix density
@@ -219,9 +219,9 @@ results/                     ── every CSV and figure lands here ──
 ├── marlin_density.*         The same split vs. matrix density
 ├── delegation_full_marlin.* Delegating inside a whole Marlin proof
 │                            (each figure is written as both .pdf and .png)
-└── thesis/                  ── trimmed variants for embedding in the text ──
-    ├── amortization_prover_thesis.*    n ∈ {2^10, 2^14, 2^18} only
-    ├── amortization_verifier_thesis.*  n ∈ {2^10, 2^14, 2^18} only
+└── thesis/                  ── variants shaped for embedding in the text ──
+    ├── amortization_prover_thesis.*    all six n, as 2 rows of 3 panels
+    ├── amortization_verifier_thesis.*  all six n, as 2 rows of 3 panels
     ├── marlin_split_thesis.*           composition panel alone
     └── marlin_density_thesis.*         composition panel alone
 ```
@@ -255,20 +255,61 @@ Defaults: `--ns 8,16 --ks 1,2,4,8,16 --reps 5`, output to stdout. Columns are
 Plotting the sweep (needs `pandas` + `matplotlib`):
 
 ```bash
-python scripts/plot_amortization.py results/results.csv \
-    --verifier-csv results/results_verifier.csv --out results/amortization.pdf
+python scripts/plot_amortization.py results/results.csv --out results/amortization.pdf
 
 # or as two files, one row each
 python scripts/plot_amortization.py results/results.csv --side prover \
     --out results/amortization_prover.pdf
 python scripts/plot_amortization.py results/results.csv --side verifier \
-    --verifier-csv results/results_verifier.csv --out results/amortization_verifier.pdf
+    --out results/amortization_verifier.pdf
 ```
 
-`--verifier-csv` swaps the stale Side-2 `verify_ms` column for the post-fix
-measurements in `results/results_verifier.csv` (Side 1 is untouched — one lincheck
-verify never ran the naive exponentiation). Without it the script warns and
-plots the pre-fix numbers.
+No flags: [`results/results.csv`](results/results.csv) is checked in **plot-ready**, and
+every figure above is exactly what it contains.
+
+That is worth stating precisely, because its two `verify_ms` columns are *not*
+what a fresh `bench_csv` sweep emits — both were replaced by dedicated
+measurements, for different reasons:
+
+* **Side 2** was measured before the square-and-multiply fix in
+  `rok_pcc::evaluate_constraint` and overstated the verifier by up to ~14× at
+  `n = 2^18`. It now carries the post-fix stage sum
+  (`v_fold + v_discharge + v_rokp + v_lincheck`) from
+  [`results/results_verifier.csv`](results/results_verifier.csv). Statement preparation is
+  deliberately not in that sum — see `patch_side2_verify`.
+* **Side 1** is one lincheck verify and nothing else, so its cost is
+  `K`-independent — but in the sweep that millisecond-scale number is timed
+  right after a `K`-lincheck prover run that can take half an hour, and it
+  inherits whatever frequency state the machine drifted into (7.5 ms at
+  `n = 2^20, K = 32` against a flat ~3.5 ms). It now carries a dedicated 9-rep
+  measurement, one value per `n` broadcast across `K`.
+
+`prove_ms` is untouched in both cases — the naive exponentiation was only ever
+on the verifier's path, and the prover timings never had the drift exposure.
+
+After re-running `bench_csv` you get raw verifier columns back, and need both
+substitutions before the figures mean anything. `--verifier-csv` and
+`--side1-csv` apply them (they are no-ops against the checked-in CSV). The
+Side-1 input is itself a `bench_csv` run — `--ks 1` suffices, since the quantity
+does not depend on `K` — at ~13 min for all six `n`:
+
+```bash
+cargo run --release --example bench_csv -- \
+    --ns 1024,4096,16384,65536,262144,1048576 --ks 1 --reps 9 \
+    --out results/side1_verify.csv
+
+python scripts/plot_amortization.py results/results.csv --side verifier \
+    --side1-csv results/side1_verify.csv \
+    --verifier-csv results/results_verifier.csv \
+    --out results/amortization_verifier.pdf
+```
+
+One measurement note for anyone comparing the two files: the Side-1 column sits
+0–22% above `v_lincheck_ms` in `results_verifier.csv`, which times the *same*
+`InnerLincheck::verify` call. There it runs back-to-back with itself and stays
+warm in cache; in `bench_csv` it runs once, immediately after a lincheck *prove*
+has evicted it. The cold number is the realistic one for a party that has just
+been handed a proof, so that is the one plotted.
 
 Verifier-side sweep — the same grid, but the Side-2 prover runs **once** per
 `(n, K)` and only the local party's verification is re-timed, split into its
@@ -277,7 +318,7 @@ sweep is not needed:
 
 ```bash
 cargo run --release --example bench_verifier_csv -- \
-    --ns 1024,4096,16384,65536,262144 --ks 1,2,4,8,16,32,64,128 \
+    --ns 1024,4096,16384,65536,262144,1048576 --ks 1,2,4,8,16,32,64,128 \
     --reps 9 --out results/results_verifier.csv
 
 python scripts/plot_verifier_amortization.py results/results_verifier.csv \
@@ -320,15 +361,16 @@ python scripts/plot_marlin_density.py results/results_marlin_density.csv \
     --n 16384 --out results/marlin_density.pdf
 ```
 
-Trimmed variants for embedding in the thesis text — `--n` takes a subset of the
-sweep, `--panels composition` emits the left panel alone:
+Variants shaped for embedding in the thesis text — `--ncols` wraps the per-`n`
+panels into a grid instead of one wide row (a page is taller than it is wide),
+`--n` takes a subset of the sweep, `--panels composition` emits the left panel
+alone:
 
 ```bash
 python scripts/plot_amortization.py results/results.csv --side prover \
-    --n 1024,16384,262144 --out results/thesis/amortization_prover_thesis.pdf
+    --ncols 3 --out results/thesis/amortization_prover_thesis.pdf
 python scripts/plot_amortization.py results/results.csv --side verifier \
-    --verifier-csv results/results_verifier.csv --n 1024,16384,262144 \
-    --out results/thesis/amortization_verifier_thesis.pdf
+    --ncols 3 --out results/thesis/amortization_verifier_thesis.pdf
 python scripts/plot_marlin_split.py results/results_marlin_split.csv \
     --panels composition --out results/thesis/marlin_split_thesis.pdf
 python scripts/plot_marlin_density.py results/results_marlin_density.csv \
@@ -351,14 +393,19 @@ own `round3_ms`.
 ## Results
 
 The checked-in [`results/results.csv`](results/results.csv) is the sweep behind
-[`results/amortization.png`](results/amortization.png), covering `n = 2^10 … 2^18` and
+[`results/amortization.png`](results/amortization.png), covering `n = 2^10 … 2^20` and
 `K = 1 … 128` at 5 reps. Reproduce it with:
 
 ```bash
 cargo run --release --example bench_csv -- \
-    --ns 1024,4096,16384,65536,262144 --ks 1,2,4,8,16,32,64,128 \
+    --ns 1024,4096,16384,65536,262144,1048576 --ks 1,2,4,8,16,32,64,128 \
     --reps 5 --out results/results.csv
 ```
+
+Budget most of a day for the full grid: `n = 2^20` alone is ~8 h, three quarters
+of it in the two `K ∈ {64, 128}` Side-1 cells (`K` linchecks at ~13.5 s each).
+Peak RSS there is ~22 GB — `AbcWitness` carries `u, v` as dense length-`n`
+vectors, so 128 leaves is 8.6 GB and the bench clones the leaf set once per rep.
 
 The headline number is the crossover `K*` — the smallest batch size at which the
 Server's Side-2 (fold + one lincheck) proving time beats Side-1 (`K` independent
@@ -369,8 +416,9 @@ linchecks):
 | `2^10`   | —    | 3.1 s → 7.6 s                              | 0.41×    |
 | `2^12`   | 4    | 10.6 s → 8.1 s                             | 1.3×     |
 | `2^14`   | 4    | 40.2 s → 9.2 s                             | 4.4×     |
-| `2^16`   | 4    | 149.9 s → 14.3 s                           | 10.5×    |
+| `2^16`   | 4    | 143.5 s → 15.2 s                           | 9.5×     |
 | `2^18`   | 4    | 522.7 s → 28.6 s                           | 18.3×    |
+| `2^20`   | 4    | 1730.0 s → 81.3 s                          | 21.3×    |
 
 Side-1 proving is linear in `K`; Side-2 is dominated by the single lincheck on
 the folded claim, so the gap widens with both `n` and `K`. At `n = 2^10` the
@@ -378,40 +426,70 @@ fold's fixed cost never amortizes within `K ≤ 128` — the per-job lincheck is
 already too cheap to be worth folding.
 
 The trade is on the verifier: Side-1 verification is essentially flat in both
-`n` and `K` (~4 ms, one lincheck), while Side-2 costs a fold path + `RokP` +
-lincheck and grows with `log K` — 8.4 ms at `K = 1` up to 33.6 ms at `K = 128`
+`n` and `K` (3.3–3.9 ms, one lincheck), while Side-2 costs a fold path + `RokP` +
+lincheck and grows with `log K` — 8.2 ms at `K = 1` up to 34.7 ms at `K = 128`
 (measured at `n = 2^18`, from [`results/results_verifier.csv`](results/results_verifier.csv)).
 
-> **Note.** The Side-2 `verify_ms` column of [`results/results.csv`](results/results.csv)
-> predates the square-and-multiply fix in `rok_pcc::evaluate_constraint` and
-> overstates the verifier by up to ~14× at `n = 2^18`. The `prove_ms` column is
-> unaffected — the naive exponentiation was only ever on the verifier's path,
-> and Side 1's verifier never ran it either. The plots work around this with
-> `--verifier-csv results/results_verifier.csv`, which substitutes post-fix
-> measurements of the same four stages; re-run `bench_csv` if you want the CSV
-> itself refreshed.
+> **Note.** Both `verify_ms` columns of [`results/results.csv`](results/results.csv) are
+> substituted measurements, not what `bench_csv` emitted — Side 2 because the
+> sweep predates the `rok_pcc::evaluate_constraint` fix, Side 1 because a
+> millisecond timing taken inside a half-hour prover cell inherits the machine's
+> frequency drift. [Plotting the sweep](#building--running) above gives the full
+> account and the two commands that reproduce them. `prove_ms` is untouched.
+
+> **`n = 2^16` was re-measured.** The original block was taken while the machine
+> dropped frequency partway through: the cost of one Side-1 lincheck, which must
+> be flat in `K`, ran 1001 ms at `K ≤ 8` but 1848 ms at `K = 64`, and a ~2×
+> excursion spanning `(K=32, Side 2)` and `(K=64, Side 1)` — adjacent cells in
+> execution order — left Side 2 *non-monotone* in `K` (8.6 s at `K = 32` against
+> 7.2 s at `K = 64`). The row was re-run whole, in one window, so it is
+> internally consistent: 1013–1145 ms per lincheck across the sweep, Side 2
+> monotone. `K*` is unchanged at 4. Its absolute times sit ~13% above the old
+> `K ≤ 8` cells, so — as with the density benchmark below — **compare within a
+> row, not across rows.**
+
+> **`n = 2^20` measurement quality.** The block is sound — Side 2 is strictly
+> monotone in `K`, `K*` = 4 with a 14% margin — but it carries the same mild
+> drift: one Side-1 lincheck ranges 13007–14571 ms across the row (12%, peaking
+> at `K = 32`, whose raw Side-1 `verify_ms` also doubled — that column has since
+> been re-measured, see the note above). No cell is off by the ~2×
+> that made the original `n = 2^16` row unusable, and no conclusion moves, so it
+> was kept as measured. A related artifact: `bench_csv`'s `K = 1` Side-1 time
+> (13007 ms) and `bench_verifier_csv`'s `p_local_lincheck_ms` (11365 ms) are the
+> *same operation* measured 15% apart in two processes — at `n = 2^18` the two
+> agree to 0.4%. Both are reported above, in their own tables; do not divide one
+> by the other.
+>
+> `n = 2^20` is absent from
+> [`results/delegation_full_marlin.png`](results/delegation_full_marlin.png): that figure
+> inner-joins on `n` with `results_marlin_split.csv`, which has no `2^20` row.
+> Adding one means running `bench_marlin_split` at `n = 2^20`, where its
+> `D = 4n` sizing needs a `2^22` SRS.
 
 ### Verifier-side amortization cost
 
 The local party's verification splits into three parts:
 
-| part | stage | `n = 2^10` | `n = 2^18` | scales with |
-|------|-------|-----------:|-----------:|-------------|
-| **1** | statement prep (4 sparse commitments) | 0.92 ms | 1.04 ms | — |
-| **1** | fold path verify                      | 0.66 ms | 0.66 ms | `log K` |
-| **1** | promise discharge                     | 24.8 ms | 24.5 ms | `log K` |
-|       | **proof of inclusion — subtotal**     | **26.4 ms** | **26.2 ms** | `log K` |
-| **2** | `RokP` verify                         | 4.16 ms | 4.15 ms | — |
-| **3** | inner-lincheck verify                 | 3.21 ms | 3.24 ms | — |
+| part | stage | `n = 2^10` | `n = 2^18` | `n = 2^20` | scales with |
+|------|-------|-----------:|-----------:|-----------:|-------------|
+| **1** | statement prep (4 sparse commitments) | 0.92 ms | 0.89 ms | 1.13 ms | — |
+| **1** | fold path verify                      | 0.65 ms | 0.68 ms | 0.70 ms | `log K` |
+| **1** | promise discharge                     | 24.2 ms | 25.5 ms | 25.4 ms | `log K` |
+|       | **proof of inclusion — subtotal**     | **25.8 ms** | **27.1 ms** | **27.3 ms** | `log K` |
+| **2** | `RokP` verify                         | 4.13 ms | 4.30 ms | 4.35 ms | — |
+| **3** | inner-lincheck verify                 | 3.21 ms | 3.36 ms | 3.37 ms | — |
 
 (at `K = 128`; [`results/verifier_amortization.png`](results/verifier_amortization.png) plots
 part 1, which is the term amortization adds per participating party — pass
 `--with-rokp` to fold part 2 back in.)
 
-Parts 2 and 3 are a fixed 7.4 ms tail, flat in both `n` and `K`. Part 1 is
-independent of `n` too — the five curves agree to 10% for `K ≥ 2` — and grows
-only with `log K`, at roughly 2.9 ms per doubling, essentially all of it in the
-promise discharge. Statement preparation is the client's own share: committing
+Parts 2 and 3 are a fixed 7.3–7.7 ms tail, flat in both `n` and `K`. Part 1 is
+independent of `n` too — the six curves agree to 15% for `K ≥ 2`, across a 1024×
+range of `n` — and grows only with `log K`, at roughly 3.1 ms per doubling,
+essentially all of it in the promise discharge. (The whole grid is measured in
+one run, so that agreement is a within-session number; the ±15% is measurement
+scatter on quantities of a few ms, not an `n`-dependence — it does not trend
+with `n`.) Statement preparation is the client's own share: committing
 to its four sparse leaf polynomials. It is *not* charged the `O(n)` evaluation
 of `y_A, y_B, y_C` — that is the answer it is delegating.
 
@@ -426,20 +504,21 @@ Marlin never runs it ([`results/delegation_gain.png`](results/delegation_gain.pn
 
 | `n`    | Marlin inner sumcheck | delegate + verify (`K = 128`) | gain | break-even |
 |--------|----------------------:|------------------------------:|-----:|-----------:|
-| `2^10` |  26.9 ms              | 33.8 ms                       | 0.8× | `K = 32`   |
-| `2^12` |  83.1 ms              | 33.6 ms                       | 2.5× | —          |
-| `2^14` | 285.4 ms              | 33.0 ms                       | 8.7× | —          |
-| `2^16` | 1009.5 ms             | 32.8 ms                       | 30.8× | —         |
-| `2^18` | 4063.4 ms             | 33.6 ms                       | 121× | —          |
+| `2^10` |  27.7 ms              | 33.1 ms                       | 0.8× | `K = 32`   |
+| `2^12` |  80.6 ms              | 33.3 ms                       | 2.4× | —          |
+| `2^14` | 272.4 ms              | 32.8 ms                       | 8.3× | —          |
+| `2^16` | 934.9 ms              | 33.3 ms                       | 28.1× | —         |
+| `2^18` | 4041.8 ms             | 34.7 ms                       | 116× | —          |
+| `2^20` | 11365.0 ms            | 35.0 ms                       | 325× | —          |
 
 For reference, not plotted: running this construction *unamortized* costs
-`RokP::reduce` + lincheck = 10.8 s at `n = 2^18`, so the encoding is 2.7× a
+`RokP::reduce` + lincheck = 11.2 s at `n = 2^18`, so the encoding is 2.8× a
 plain lincheck before the fold buys anything back (`p_local_rokp_ms` in the
 CSV).
 
-The 33.6 ms is the conservative reading, where the party checks the Server's
+The 34.7 ms is the conservative reading, where the party checks the Server's
 work itself. A party that only needs to *forward* the proof to a third-party
-verifier pays statement preparation alone — 1.04 ms, a 3900× reduction — and the
+verifier pays statement preparation alone — 0.89 ms, a 4500× reduction — and the
 ~30 ms lands on the end verifier instead. That is the additive `O(log K)`
 verifier overhead, i.e. a transfer of cost rather than a saving.
 
@@ -448,11 +527,11 @@ is separable from the fixed tail:
 
 | part | at `n = 2^18`, `K = 128` |
 |------|-------------------------:|
-| **1** proof of inclusion — statement prep + fold path + promise discharge | 26.18 ms |
-| **2** `RokP` verify | 4.15 ms |
-| **3** folded lincheck verify | 3.24 ms |
+| **1** proof of inclusion — statement prep + fold path + promise discharge | 27.09 ms |
+| **2** `RokP` verify | 4.30 ms |
+| **3** folded lincheck verify | 3.36 ms |
 
-Parts 2 and 3 are a fixed 7.4 ms tail, flat in both `n` and `K`; all of the
+Parts 2 and 3 are a fixed 7.7 ms tail, flat in both `n` and `K`; all of the
 growth is in part 1's promise discharge.
 
 ### What amortization costs the verifying side
@@ -463,14 +542,14 @@ proofs of inclusion plus a single `RokP` and a single folded lincheck (the
 aggregate reading, where one auditor checks everything).
 
 Amortization **loses** here, by 2.6× at `K = 1` rising to 8.1× at `K = 128`
-(`n = 2^18`: 415 ms → 3358 ms). This is not a defect — it is the additive
+(`n = 2^18`: 430 ms → 3475 ms). This is not a defect — it is the additive
 `O(log K)` verifier overhead the construction trades for the Server's `O(K·s) →
-O(K·log K + s)` saving, made explicit. One proof of inclusion costs 26.2 ms
-against 3.2 ms for a plain lincheck verify, and that per-job ratio itself grows
+O(K·log K + s)` saving, made explicit. One proof of inclusion costs 27.1 ms
+against 3.4 ms for a plain lincheck verify, and that per-job ratio itself grows
 with `log K`, so the gap widens slowly rather than converging.
 
 In the true multi-verifier setting the `K` verifiers cannot communicate, so each
-checks parts 2 and 3 for itself and the amortized total is `K · 33.6 ms` —
+checks parts 2 and 3 for itself and the amortized total is `K · 34.7 ms` —
 strictly worse again. The plotted reading is the generous one.
 
 ### How much of Marlin can be delegated at all
@@ -496,7 +575,7 @@ delegatable share by ~6 points.)
 So the whole-proof speedup is capped at `(WD + WI)/WD ≈ 1.6–1.8×` no matter how
 cheap verification becomes. [`results/delegation_full_marlin.png`](results/delegation_full_marlin.png)
 plots the approach to that ceiling: at `n = 2^18` delegation reaches **1.81×**
-against a ceiling of 1.82× — verification (33.6 ms) is negligible beside a 6.3 s
+against a ceiling of 1.82× — verification (34.7 ms) is negligible beside a 6.3 s
 witness-dependent half — while at `n = 2^10` it decays from 1.55× to 1.20× as
 `K` grows, because there the `log K` verification overhead is no longer small.
 
