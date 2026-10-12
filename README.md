@@ -456,8 +456,8 @@ lincheck and grows with `log K` — 8.2 ms at `K = 1` up to 34.7 ms at `K = 128`
 > that made the original `n = 2^16` row unusable, and no conclusion moves, so it
 > was kept as measured. A related artifact: `bench_csv`'s `K = 1` Side-1 time
 > (13007 ms) and `bench_verifier_csv`'s `p_local_lincheck_ms` (11365 ms) are the
-> *same operation* measured 15% apart in two processes — at `n = 2^18` the two
-> agree to 0.4%. Both are reported above, in their own tables; do not divide one
+> *same operation* measured 14% apart in two processes — at `n = 2^18` the two
+> agree to 0.9%. Both are reported above, in their own tables; do not divide one
 > by the other.
 >
 > `n = 2^20` is absent from
@@ -483,7 +483,7 @@ The local party's verification splits into three parts:
 part 1, which is the term amortization adds per participating party — pass
 `--with-rokp` to fold part 2 back in.)
 
-Parts 2 and 3 are a fixed 7.3–7.7 ms tail, flat in both `n` and `K`. Part 1 is
+Parts 2 and 3 are a fixed 7.3–7.8 ms tail, flat in both `n` and `K`. Part 1 is
 independent of `n` too — the six curves agree to 15% for `K ≥ 2`, across a 1024×
 range of `n` — and grows only with `log K`, at roughly 3.1 ms per doubling,
 essentially all of it in the promise discharge. (The whole grid is measured in
@@ -504,7 +504,7 @@ Marlin never runs it ([`results/delegation_gain.png`](results/delegation_gain.pn
 
 | `n`    | Marlin inner sumcheck | delegate + verify (`K = 128`) | gain | break-even |
 |--------|----------------------:|------------------------------:|-----:|-----------:|
-| `2^10` |  27.7 ms              | 33.1 ms                       | 0.8× | `K = 32`   |
+| `2^10` |  27.7 ms              | 33.1 ms                       | 0.8× | `K = 64`   |
 | `2^12` |  80.6 ms              | 33.3 ms                       | 2.4× | —          |
 | `2^14` | 272.4 ms              | 32.8 ms                       | 8.3× | —          |
 | `2^16` | 934.9 ms              | 33.3 ms                       | 28.1× | —         |
@@ -561,35 +561,38 @@ be handed to a Server. From [`results/results_marlin_split.csv`](results/results
 
 | `n`    | witness-dependent | witness-independent | ceiling |
 |--------|------------------:|--------------------:|--------:|
-| `2^10` | 58.7% / 62.5%     | 41.3% / 37.5%       | 1.70× / 1.60× |
-| `2^12` | 55.8% / 60.6%     | 44.2% / 39.4%       | 1.79× / 1.65× |
-| `2^14` | 54.5% / 61.6%     | 45.5% / 38.4%       | 1.83× / 1.62× |
-| `2^16` | 54.3% / 60.1%     | 45.7% / 39.9%       | 1.84× / 1.66× |
-| `2^18` | 54.8% / 61.4%     | 45.2% / 38.6%       | 1.82× / 1.63× |
+| `2^10` | 58.1% / 63.1%     | 41.9% / 36.9%       | 1.72× / 1.59× |
+| `2^12` | 56.7% / 61.2%     | 43.3% / 38.8%       | 1.76× / 1.63× |
+| `2^14` | 55.9% / 61.4%     | 44.1% / 38.6%       | 1.79× / 1.63× |
+| `2^16` | 54.8% / 60.9%     | 45.2% / 39.1%       | 1.82× / 1.64× |
+| `2^18` | 56.2% / 60.1%     | 43.8% / 39.9%       | 1.78× / 1.66× |
 
 (`no ZK / ZK`. Witness-independent counts round 3 **plus** `t(X)`, which sits
-inside round 2 but depends only on `α` and the matrices — about 1% of the
+inside round 2 but depends only on `α` and the matrices — about 0.5% of the
 prover. Zero-knowledge work is entirely witness-dependent, so it shrinks the
-delegatable share by ~6 points.)
+delegatable share by ~5 points.)
 
 So the whole-proof speedup is capped at `(WD + WI)/WD ≈ 1.6–1.8×` no matter how
 cheap verification becomes. [`results/delegation_full_marlin.png`](results/delegation_full_marlin.png)
-plots the approach to that ceiling: at `n = 2^18` delegation reaches **1.81×**
-against a ceiling of 1.82× — verification (34.7 ms) is negligible beside a 6.3 s
-witness-dependent half — while at `n = 2^10` it decays from 1.55× to 1.20× as
-`K` grows, because there the `log K` verification overhead is no longer small.
+plots the approach to that ceiling: at `n = 2^18` delegation reaches **1.77×**
+against a ceiling of 1.78× — verification (34.7 ms) is negligible beside a 9.4 s
+witness-dependent half — while at `n = 2^10` it decays from 1.45× to **1.00×**,
+buying nothing at all by `K = 128`, because there the `log K` verification
+overhead is no longer small.
 
-> The 121× in `results/delegation_gain.png` and the 1.8× here are not in conflict: the
-> first is the speedup on the *inner sumcheck alone*, the second is what that
-> becomes once the undelegatable half of the prover is included. The second is
+> The 325× in `results/delegation_gain.png` (116× at `n = 2^18`, the largest `n`
+> the split is measured at) and the 1.8× here are not in conflict: the first is
+> the speedup on the *inner sumcheck alone*, the second is what that becomes
+> once the undelegatable half of the prover is included. The second is
 > the number to quote for a full Marlin proof.
 
 The `D = 4n` SRS this benchmark needs (for the ZK mask, degree `3n − 1`) does
 **not** distort the split: both rounds carry one degree-`D` shifted commitment
 and one degree-`D` batched opening, so the inflation is near-symmetric and
 cancels in the ratio. Re-measuring at `D = 2n` (`--srs-mult 2 --zk off`) moves
-the witness-independent share by ~1 point (42.7% vs 44.2% at `n = 2^12`; 44.9%
-vs 45.5% at `n = 2^14`), and reproduces `p_local_lincheck_ms` to within 6–9%.
+the witness-independent share by under a point, in either direction (42.7% vs
+43.3% at `n = 2^12`; 44.9% vs 44.1% at `n = 2^14`), and reproduces
+`p_local_lincheck_ms` to within 6–9%.
 
 ### Denser matrices are better for delegation
 
@@ -634,7 +637,7 @@ where delegating the witness-independent half is worth 2.2–2.9× rather than
 
 The local party's delegated cost is flat in `n`, so the gain is set entirely by
 how expensive the local prove is. At `n = 2^10` the lincheck is already cheap
-enough that the amortization overhead overtakes it at `K = 32`; from `n = 2^12`
+enough that the amortization overhead overtakes it at `K = 64`; from `n = 2^12`
 up, delegation wins across the whole sweep. Note the gain *decreases* in `K`:
 amortization is a win for the Server, and the local party pays a `log K` premium
 for it.
