@@ -12,12 +12,13 @@ Server-delegation scenario. A local party with one R_{A,B,C} job either
 
   (ii) delegates: commits to its four sparse leaf polynomials, then verifies the
        amortized proof. It never computes `y_A, y_B, y_C` itself; that is what
-       it delegates. Two depths are plotted:
+       it delegates. Two depths are plotted by default:
          * end-to-end (1 + 2 + 3): proof of inclusion + RokP verify + one
            inner-lincheck verify on the folded R_P claim,
          * inclusion only (1): statement prep + fold path + promise discharge.
        The gap between them is the fixed RokP + lincheck tail, ~7.4 ms, which
-       every party pays regardless of K.
+       every party pays regardless of K. `--no-inclusion` drops the second,
+       leaving the one curve that answers "is delegating worth it".
 
 Common starting point: both sides begin the moment the verifier samples β
 (arkworks `verifier_second_round`), with the claim `t(β)` — this repo's R_P
@@ -69,6 +70,13 @@ def main():
     ap.add_argument("--out", default="results/delegation_gain.pdf")
     ap.add_argument("--reference", action="store_true",
                     help="also draw the no-proof floor (direct evaluation)")
+    ap.add_argument("--ncols", type=int, default=None,
+                    help="wrap the per-n panels into a grid this many columns "
+                         "wide, e.g. --ncols 3 for six n as 2 rows of 3; "
+                         "default is one row of panels, one per n")
+    ap.add_argument("--no-inclusion", action="store_true",
+                    help="drop the inclusion-only curve, leaving the "
+                         "end-to-end delegated cost against the local baseline")
     args = ap.parse_args()
 
     df = pd.read_csv(args.csv)
@@ -91,16 +99,22 @@ def main():
     df["gain"] = df["p_local_lincheck_ms"] / df["client_ms"]
 
     ns = sorted(df["n"].unique())
-    fig, axes = plt.subplots(1, len(ns), figsize=(3.5 * len(ns), 4.0),
+    if args.ncols is None:
+        nrows, ncols = 1, len(ns)
+    else:
+        ncols = max(1, args.ncols)
+        nrows = -(-len(ns) // ncols)  # ceil
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.5 * ncols, 4.0 * nrows),
                              squeeze=False)
 
-    for col, n in enumerate(ns):
+    for i, n in enumerate(ns):
         sub = df[df["n"] == n].sort_values("k")
         if sub.empty:
             continue
 
         # -- absolute cost to the local party --------------------------------
-        ax = axes[0, col]
+        row, col = i // ncols, i % ncols
+        ax = axes[row, col]
         local = sub["p_local_lincheck_ms"].iloc[0]
         ax.axhline(local, color=C_LOCAL, linewidth=2, linestyle="--",
                    label="prove locally: Marlin inner sumcheck")
@@ -109,19 +123,27 @@ def main():
             ax.axhline(sub["ref_direct_eval_ms"].iloc[0], color=INK_MUTED,
                        linewidth=1.0, linestyle="-.",
                        label="evaluate it yourself (no proof)")
+        # The "(a) + (b) + (c)" naming only means something next to the (a)
+        # curve, so dropping that one renames this series rather than leaving a
+        # reference to parts the figure no longer shows.
+        deleg_label = ("delegate: verify an amortization's proof"
+                       if args.no_inclusion
+                       else "delegate: verify $(a) + (b) + (c)$ (end-to-end)")
         ax.plot(sub["k"], sub["client_ms"], "o-", color=C_DELEG,
-                linewidth=2, markersize=5,
-                label="delegate: verify $(a) + (b) + (c)$ (end-to-end)")
-        ax.plot(sub["k"], sub["inclusion_ms"], "s--", color=C_INCL,
-                linewidth=1.8, markersize=5,
-                label="delegate: verify $(a)$ (proof of inclusion)")
-        if col == len(ns) - 1:
+                linewidth=2, markersize=5, label=deleg_label)
+        if not args.no_inclusion:
+            ax.plot(sub["k"], sub["inclusion_ms"], "s--", color=C_INCL,
+                    linewidth=1.8, markersize=5,
+                    label="delegate: verify $(a)$ (proof of inclusion)")
+        if i == len(ns) - 1:
             ax.annotate("prove locally", (sub["k"].iloc[0], local),
                         textcoords="offset points", xytext=(2, 5),
                         fontsize=8, color=C_LOCAL)
         ax.set_xscale("log", base=2)
         ax.set_yscale("log")
-        ax.set_xlabel("$K$")
+        # In a grid, label the outer edge only — every panel shares both axes.
+        bottom_of_column = (i + ncols) >= len(ns)
+        ax.set_xlabel("$K$" if bottom_of_column else "")
         ax.set_ylabel("local-party time (ms)" if col == 0 else "")
         ax.set_title(n_label(n), fontsize=10, color=INK, loc="left")
         # Headroom, so the baseline rule does not sit on the top spine.
@@ -154,13 +176,18 @@ def main():
                         fontsize=8, color=INK_MUTED, ha="right", va="top")
         style(ax)
 
+    # Blank any trailing cells the n values do not fill.
+    for j in range(len(ns), nrows * ncols):
+        axes[j // ncols, j % ncols].set_visible(False)
+
     # One legend for the whole figure: a per-panel box collides with the
     # baseline rule.
     handles, labels = axes[0, 0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=len(labels),
                frameon=False, fontsize=8.5)
 
-    fig.tight_layout(rect=(0, 0.09, 1, 1))
+    # Reserve the same absolute strip for the legend however many rows there are.
+    fig.tight_layout(rect=(0, 0.09 / nrows, 1, 1))
     fig.savefig(args.out)
     print(f"wrote {args.out}")
 
